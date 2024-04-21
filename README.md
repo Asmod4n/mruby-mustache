@@ -1,5 +1,6 @@
 # mruby-mustache
 Mustache templates for mruby as a mruby wrapper around the c library https://gitlab.com/jobol/mustach
+
 mustach is a C implementation of the mustache template specification, version 1.4.1.
 
 Requirements
@@ -26,7 +27,9 @@ refer to https://mustache.github.io/mustache.5.html for more information about t
 Notes
 =====
 This mruby gem doesn't aim to be compatible with the API of the official Ruby Mustache gem nor support all its features, especially not the unsafe ones like File reading or running of ruby code inside a template.
+
 The c library mustach ships with JSON as the data exchange format by default, if you use Mustache.mustache the data object is automatically converted to a JSON string and passed to mustach.
+
 Once mustach ships with a Object oriented compatible API this gem will be updated to support that too.
 
 Errorhandling
@@ -39,13 +42,16 @@ API
 Mustache.mustache(template, data, data_type = :ruby, flags = Mustache::With_AllExtensions)
 ```
 template is a Mustache template.
+
 data is the data to apply to the template.
+
 data_type can be :ruby or :json, when using :json you must pass a JSON conforming string as data.
 
 flags is a bitmask
 
 Here is a flags summary.
 
+```pre
 Flag name                      | Description
 -------------------------------+------------------------------------------------
 Mustache::With_Colon           | Explicit tag substitution with colon
@@ -60,7 +66,7 @@ Mustache::With_ErrorUndefined  | Error when a requested tag is undefined
 -------------------------------+------------------------------------------------
 Mustache::With_AllExtensions   | Activate all known extensions
 Mustache::With_NoExtensions    | Disable any extension
-
+```
 you can use multiple flags like this Mustache::With_Equal | Mustache::With_Compare
 
 For details about the flags, see below.
