@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mruby/numeric.h>
+#include <mruby/fast_json.h>
 
 #if (__GNUC__ >= 3) || (__INTEL_COMPILER >= 800) || defined(__clang__)
 # define likely(x) __builtin_expect(!!(x), 1)

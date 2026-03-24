@@ -2,6 +2,7 @@ MRuby::Gem::Specification.new('mruby-mustache') do |spec|
   spec.license = 'Apache-2'
   spec.author  = 'Hendrik'
   spec.summary = 'mustache templates for mruby'
+  spec.add_dependency 'mruby-fast-json'
 
   json_implementation = nil
   if spec.search_package('libcjson')
