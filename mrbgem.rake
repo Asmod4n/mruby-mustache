@@ -3,9 +3,12 @@ MRuby::Gem::Specification.new('mruby-mustache') do |spec|
   spec.author  = 'Hendrik'
   spec.summary = 'Mustache templates for mruby (native Hash/Array, no JSON layer)'
 
-  if spec.build.toolchains.include? 'visualcpp'
-    spec.cc.defines << 'NO_OPEN_MEMSTREAM'
-  end
+if spec.build.toolchains.include? 'visualcpp'
+  spec.cc.defines << 'NO_OPEN_MEMSTREAM'
+  spec.cc.defines << '_CRT_NONSTDC_NO_DEPRECATE'    # POSIX names like fdopen
+  spec.cc.defines << '_CRT_SECURE_NO_WARNINGS'      # belt-and-braces
+  spec.cc.defines << 'ssize_t=ptrdiff_t'
+end
   spec.cc.defines << 'MUSTACH_SAFE' << '_GNU_SOURCE'
 
   mustach_src = "#{spec.dir}/deps/mustach"
