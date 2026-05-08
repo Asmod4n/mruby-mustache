@@ -326,7 +326,11 @@ ctx_lookup(mrb_state *mrb, mrb_value *stack, mrb_int depth, mrb_value key)
   mrb_int klen = RARRAY_LEN(key);
   if (klen == 0) return stack[depth - 1];
 
-  mrb_value first = mrb_ary_ref(mrb, key, 0);
+  /* Key arrays are built in parse_key and frozen by convention (never
+   * mutated post-compile). Direct pointer access is safe; we read each
+   * segment fresh inside the loop in case GC touches things we don't see. */
+  mrb_value *kp = RARRAY_PTR(key);
+  mrb_value first = kp[0];
 
   mrb_value base = mrb_nil_value();
   int found = 0;
@@ -339,7 +343,7 @@ ctx_lookup(mrb_state *mrb, mrb_value *stack, mrb_int depth, mrb_value key)
 
   for (mrb_int j = 1; j < klen; j++) {
     if (mrb_nil_p(base) || !mrb_hash_p(base)) return mrb_nil_value();
-    mrb_value seg = mrb_ary_ref(mrb, key, j);
+    mrb_value seg = kp[j];
     base = hash_lookup_str(mrb, base, seg);
     if (mrb_nil_p(base)) return mrb_nil_value();
   }
@@ -416,8 +420,9 @@ render_section(mrb_state *mrb, mrb_value ops,
   if (mrb_array_p(v)) {
     mrb_int n = RARRAY_LEN(v);
     if (n == 0) return;
+    mrb_value *vp = RARRAY_PTR(v);
     for (mrb_int i = 0; i < n; i++) {
-      mrb_value elem = mrb_ary_ref(mrb, v, i);
+      mrb_value elem = vp[i];
       push_or_raise(mrb, stack, depth, elem);
       run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out);
       (*depth)--;
@@ -451,7 +456,7 @@ render_partial(mrb_state *mrb, mrb_value name, mrb_value indent_str,
   }
   mrb_value tmpl = hash_lookup_str(mrb, partials, name);
   if (!mrb_obj_is_kind_of(mrb, tmpl, template_class(mrb))) return;
-  mrb_value sub = mrb_iv_get(mrb, tmpl, MRB_IVSYM(ops));
+  mrb_value sub = mrb_iv_get(mrb, tmpl, MRB_SYM(ops));
 
   if (outer_ind) emit_indent_if_pending(mrb, out, outer_ind);
 
@@ -466,6 +471,9 @@ render_partial(mrb_state *mrb, mrb_value name, mrb_value indent_str,
           partials, partial_depth + 1, &ind, out);
 }
 
+/* run_ops trusts op shape — validated once in link_ops, never re-checked
+ * here. ops_arr cached at function entry; per-iteration f cached after
+ * pc bounds check. f[1], f[2] read directly: validated to exist. */
 static void
 run_ops(mrb_state *mrb, mrb_value ops,
         mrb_int pc, mrb_int stop,
@@ -473,19 +481,22 @@ run_ops(mrb_state *mrb, mrb_value ops,
         mrb_value partials, int partial_depth,
         indent_t *ind, outbuf_t *out)
 {
+  mrb_value *ops_arr = RARRAY_PTR(ops);
+
   while (pc < stop) {
-    mrb_value op = mrb_ary_ref(mrb, ops, pc);
-    mrb_int tag = mrb_integer(mrb_ary_ref(mrb, op, 0));
+    mrb_value op = ops_arr[pc];
+    mrb_value *f = RARRAY_PTR(op);
+    mrb_int tag = mrb_integer(f[0]);
 
     switch (tag) {
       case OP_TEXT: {
-        mrb_value t = mrb_ary_ref(mrb, op, 1);
+        mrb_value t = f[1];
         emit_text_bytes(mrb, out, ind, RSTRING_PTR(t), RSTRING_LEN(t));
         pc++;
         break;
       }
       case OP_VAR: {
-        mrb_value k = mrb_ary_ref(mrb, op, 1);
+        mrb_value k = f[1];
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!mrb_nil_p(v)) {
           mrb_value s = mrb_obj_as_string(mrb, v);
@@ -495,7 +506,7 @@ run_ops(mrb_state *mrb, mrb_value ops,
         break;
       }
       case OP_RAW: {
-        mrb_value k = mrb_ary_ref(mrb, op, 1);
+        mrb_value k = f[1];
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!mrb_nil_p(v)) {
           mrb_value s = mrb_obj_as_string(mrb, v);
@@ -505,8 +516,8 @@ run_ops(mrb_state *mrb, mrb_value ops,
         break;
       }
       case OP_SECTION: {
-        mrb_value k = mrb_ary_ref(mrb, op, 1);
-        mrb_int end_pc = mrb_integer(mrb_ary_ref(mrb, op, 2));
+        mrb_value k = f[1];
+        mrb_int end_pc = mrb_integer(f[2]);
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         render_section(mrb, ops, pc + 1, end_pc, stack, depth,
                        partials, partial_depth, ind, out, v);
@@ -514,8 +525,8 @@ run_ops(mrb_state *mrb, mrb_value ops,
         break;
       }
       case OP_INVERTED: {
-        mrb_value k = mrb_ary_ref(mrb, op, 1);
-        mrb_int end_pc = mrb_integer(mrb_ary_ref(mrb, op, 2));
+        mrb_value k = f[1];
+        mrb_int end_pc = mrb_integer(f[2]);
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!section_truthy(mrb, v)) {
           run_ops(mrb, ops, pc + 1, end_pc, stack, depth,
@@ -525,8 +536,8 @@ run_ops(mrb_state *mrb, mrb_value ops,
         break;
       }
       case OP_PARTIAL: {
-        mrb_value name   = mrb_ary_ref(mrb, op, 1);
-        mrb_value indent = mrb_ary_ref(mrb, op, 2);
+        mrb_value name   = f[1];
+        mrb_value indent = f[2];
         render_partial(mrb, name, indent, stack, depth,
                        partials, partial_depth, ind, out);
         pc++;
@@ -541,7 +552,7 @@ run_ops(mrb_state *mrb, mrb_value ops,
 }
 
 /* ===================================================================== */
-/* compile-time: parse_key, strip_name, keys_equal                        */
+/* compile-time helpers                                                   */
 /* ===================================================================== */
 
 static mrb_value
@@ -851,7 +862,7 @@ strip_standalone(mrb_state *mrb, mrb_value ops)
 }
 
 /* ===================================================================== */
-/* link sections                                                          */
+/* link sections + validate op shape                                      */
 /* ===================================================================== */
 
 static mrb_value
@@ -859,6 +870,41 @@ key_to_str(mrb_state *mrb, mrb_value k)
 {
   if (RARRAY_LEN(k) == 0) return mrb_str_new_lit(mrb, ".");
   return mrb_ary_join(mrb, k, mrb_str_new_lit(mrb, "."));
+}
+
+/* Final shape check: every op in the linked output must be a 2- or 3-elt
+ * Array with a known tag. After this returns, run_ops can read fields
+ * without further validation. */
+static void
+validate_ops_shape(mrb_state *mrb, mrb_value ops)
+{
+  mrb_int n = RARRAY_LEN(ops);
+  for (mrb_int i = 0; i < n; i++) {
+    mrb_value op = mrb_ary_ref(mrb, ops, i);
+    if (!mrb_array_p(op) || RARRAY_LEN(op) < 1) {
+      mrb_raise(mrb, PARSE_ERR(mrb), "internal: malformed op");
+    }
+    mrb_value tagv = mrb_ary_ref(mrb, op, 0);
+    if (!mrb_integer_p(tagv)) {
+      mrb_raise(mrb, PARSE_ERR(mrb), "internal: non-integer op tag");
+    }
+    mrb_int t = mrb_integer(tagv);
+    mrb_int need;
+    switch (t) {
+      case OP_TEXT: case OP_VAR: case OP_RAW:
+        need = 2; break;
+      case OP_SECTION: case OP_INVERTED: case OP_PARTIAL:
+        need = 3; break;
+      default:
+        mrb_raisef(mrb, PARSE_ERR(mrb),
+                   "internal: bad op tag %d at index %d", (int)t, (int)i);
+    }
+    if (RARRAY_LEN(op) < need) {
+      mrb_raisef(mrb, PARSE_ERR(mrb),
+                 "internal: op tag %d has %d fields, needs %d",
+                 (int)t, (int)RARRAY_LEN(op), (int)need);
+    }
+  }
 }
 
 static mrb_value
@@ -919,6 +965,8 @@ link_ops(mrb_state *mrb, mrb_value tokens)
     mrb_value k = mrb_ary_ref(mrb, entry, 1);
     mrb_raisef(mrb, PARSE_ERR(mrb), "unclosed section: %S", key_to_str(mrb, k));
   }
+
+  validate_ops_shape(mrb, out);
   return out;
 }
 
@@ -934,7 +982,7 @@ template_initialize(mrb_state *mrb, mrb_value self)
   mrb_value ops = tokenize(mrb, src);
   ops = strip_standalone(mrb, ops);
   ops = link_ops(mrb, ops);
-  mrb_iv_set(mrb, self, MRB_IVSYM(ops), ops);
+  mrb_iv_set(mrb, self, MRB_SYM(ops), ops);
   return self;
 }
 
@@ -955,7 +1003,7 @@ template_render(mrb_state *mrb, mrb_value self)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "partials must be a Hash or nil");
   }
 
-  mrb_value ops = mrb_iv_get(mrb, self, MRB_IVSYM(ops));
+  mrb_value ops = mrb_iv_get(mrb, self, MRB_SYM(ops));
   mrb_value stack[MUSTACHE_MAX_DEPTH];
   mrb_int depth = 0;
   stack[depth++] = ctx;
@@ -971,10 +1019,10 @@ template_render(mrb_state *mrb, mrb_value self)
 static mrb_value
 template_tags(mrb_state *mrb, mrb_value self)
 {
-  if (mrb_iv_defined(mrb, self, MRB_IVSYM(tags))) {
-    return mrb_iv_get(mrb, self, MRB_IVSYM(tags));
+  if (mrb_iv_defined(mrb, self, MRB_SYM(tags))) {
+    return mrb_iv_get(mrb, self, MRB_SYM(tags));
   }
-  mrb_value ops = mrb_iv_get(mrb, self, MRB_IVSYM(ops));
+  mrb_value ops = mrb_iv_get(mrb, self, MRB_SYM(ops));
   mrb_value tags = mrb_ary_new(mrb);
   mrb_value seen = mrb_hash_new(mrb);
   mrb_int n = RARRAY_LEN(ops);
@@ -990,7 +1038,7 @@ template_tags(mrb_state *mrb, mrb_value self)
       }
     }
   }
-  mrb_iv_set(mrb, self, MRB_IVSYM(tags), tags);
+  mrb_iv_set(mrb, self, MRB_SYM(tags), tags);
   return tags;
 }
 
@@ -1011,7 +1059,7 @@ mustache_one_shot(mrb_state *mrb, mrb_value self)
 void
 mrb_mruby_mustache_gem_init(mrb_state *mrb)
 {
-  struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(Mustache));
+  struct RClass *m = mrb_define_module(mrb, "Mustache");
   struct RClass *err = mrb_define_class_under_id(mrb, m, MRB_SYM(Error), E_RUNTIME_ERROR);
   mrb_define_class_under_id(mrb, m, MRB_SYM(ParseError),  err);
   mrb_define_class_under_id(mrb, m, MRB_SYM(RenderError), err);
