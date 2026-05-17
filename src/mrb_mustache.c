@@ -569,6 +569,9 @@ parse_key(mrb_state *mrb, mrb_value src, mrb_int off, mrb_int len)
   mrb_int seg_start = off;
   mrb_int end = off + len;
   for (mrb_int i = off; i <= end; i++) {
+    /* Re-fetch each iteration: mrb_str_byte_subseq below can realloc
+     * src's buffer via str_share, invalidating any cached pointer. */
+    p = RSTRING_PTR(src);
     if (i == end || p[i] == '.') {
       mrb_int seg_len = i - seg_start;
       if (seg_len == 0) mrb_raise(mrb, PARSE_ERR(mrb), "bad key (empty segment)");
@@ -649,11 +652,17 @@ static mrb_value
 tokenize(mrb_state *mrb, mrb_value src)
 {
   mrb_value ops = mrb_ary_new(mrb);
-  const char *p = RSTRING_PTR(src);
   mrb_int sz = RSTRING_LEN(src);
   mrb_int pos = 0;
 
   while (pos < sz) {
+    /* Re-fetch each iteration: mrb_str_byte_subseq (called directly
+     * below and indirectly via parse_key/strip_name) triggers str_share
+     * on the first invocation, which reallocs src's buffer to shrink
+     * off unused capacity. Any cached pointer from a previous iteration
+     * (or from before the realloc inside this iteration) is freed. */
+    const char *p = RSTRING_PTR(src);
+
     mrb_int open_at = byteindex_str(p, sz, "{{", 2, pos);
     if (open_at < 0) {
       push_op2(mrb, ops, OP_TEXT, mrb_str_byte_subseq(mrb, src, pos, sz - pos));
@@ -661,6 +670,7 @@ tokenize(mrb_state *mrb, mrb_value src)
     }
     if (open_at > pos) {
       push_op2(mrb, ops, OP_TEXT, mrb_str_byte_subseq(mrb, src, pos, open_at - pos));
+      p = RSTRING_PTR(src);   /* refresh after subseq above */
     }
 
     if (open_at + 2 < sz && p[open_at + 2] == '{') {
@@ -979,6 +989,14 @@ template_initialize(mrb_state *mrb, mrb_value self)
 {
   mrb_value src;
   mrb_get_args(mrb, "S", &src);
+
+  /* Root src before any mrb_str_byte_subseq calls below. The subseq
+   * calls produce shared substrings backed by src's buffer; keeping src
+   * reachable via an ivar keeps the buffer alive and at a stable address
+   * for the lifetime of this Template, which lets tokenize/parse_key
+   * cache RSTRING_PTR(src) across iterations without UAF. */
+  mrb_iv_set(mrb, self, MRB_SYM(source), src);
+
   mrb_value ops = tokenize(mrb, src);
   ops = strip_standalone(mrb, ops);
   ops = link_ops(mrb, ops);
