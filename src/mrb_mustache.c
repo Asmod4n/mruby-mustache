@@ -1077,7 +1077,7 @@ mustache_one_shot(mrb_state *mrb, mrb_value self)
 void
 mrb_mruby_mustache_gem_init(mrb_state *mrb)
 {
-  struct RClass *m = mrb_define_module(mrb, "Mustache");
+  struct RClass *m = mrb_define_module_id(mrb, MRB_SYM(Mustache));
   struct RClass *err = mrb_define_class_under_id(mrb, m, MRB_SYM(Error), E_RUNTIME_ERROR);
   mrb_define_class_under_id(mrb, m, MRB_SYM(ParseError),  err);
   mrb_define_class_under_id(mrb, m, MRB_SYM(RenderError), err);
