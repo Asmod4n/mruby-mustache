@@ -1,3 +1,0 @@
-[submodule "deps/mustach"]
-	path = deps/mustach
-	url = https://gitlab.com/jobol/mustach
