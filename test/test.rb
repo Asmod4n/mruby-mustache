@@ -16,6 +16,50 @@ assert('renders template with no tags') do
   assert_equal 'static text', Mustache.mustache('static text', {})
 end
 
+# ---- security regressions ------------------------------------------------
+
+assert('allocate-d template raises instead of crashing on render') do
+  # Class#allocate skips initialize, so @ops is never set. render/tags must
+  # reject that rather than dereference a nil Array (was a NULL-deref SIGSEGV).
+  assert_raise(Mustache::RenderError) { Mustache::Template.allocate.render({}) }
+end
+
+assert('allocate-d template raises instead of crashing on tags') do
+  assert_raise(Mustache::RenderError) { Mustache::Template.allocate.tags }
+end
+
+assert('deeply nested inverted sections raise, not overflow the C stack') do
+  depth = 5000
+  src = ('{{^a}}' * depth) + ('{{/a}}' * depth)
+  t = Mustache::Template.compile(src)
+  assert_raise(Mustache::RenderError) { t.render({}) }   # key absent => bodies render
+end
+
+assert('section array mutated by an element to_s does not use-after-free') do
+  mutator = Class.new do
+    def initialize(arr); @arr = arr; end
+    def to_s; 64.times { @arr << 'x' }; 'e'; end   # realloc the array mid-iteration
+  end
+  arr = []
+  16.times { arr << mutator.new(arr) }
+  # Snapshotted length + bounds-checked element access must keep this safe.
+  out = Mustache.mustache('{{#arr}}{{.}}{{/arr}}', { 'arr' => arr })
+  assert_equal 16, out.length   # only the original 16 elements are rendered
+end
+
+assert('raise in to_s after buffer promotion does not corrupt or leak state') do
+  boom = Class.new { def to_s; raise 'boom'; end }
+  big  = Class.new { def to_s; 'x' * 70_000; end }   # force heap promotion first
+  t = Mustache::Template.compile('{{a}}{{b}}')
+  200.times do
+    assert_raise(RuntimeError) { t.render({ 'a' => big.new, 'b' => boom.new }) }
+  end
+  GC.start
+  # State must be intact for subsequent renders, including another large one.
+  assert_equal 'ok', Mustache.mustache('{{x}}', { 'x' => 'ok' })
+  assert_equal 70_000, Mustache.mustache('{{x}}', { 'x' => big.new }).length
+end
+
 # ---- key shapes ----------------------------------------------------------
 
 assert('symbol keys') do

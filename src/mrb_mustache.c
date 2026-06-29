@@ -420,9 +420,13 @@ render_section(mrb_state *mrb, mrb_value ops,
   if (mrb_array_p(v)) {
     mrb_int n = RARRAY_LEN(v);
     if (n == 0) return;
-    mrb_value *vp = RARRAY_PTR(v);
+    /* Re-read each element with the bounds-checked accessor rather than caching
+     * RARRAY_PTR(v): an element's to_s can run Ruby that pushes onto / reallocs
+     * this same array, freeing the backing buffer (heap-use-after-free). The
+     * length is snapshotted so growth during iteration can't loop unbounded;
+     * mrb_ary_ref returns nil for indices the array no longer has. */
     for (mrb_int i = 0; i < n; i++) {
-      mrb_value elem = vp[i];
+      mrb_value elem = mrb_ary_ref(mrb, v, i);
       push_or_raise(mrb, stack, depth, elem);
       run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out);
       (*depth)--;
@@ -529,8 +533,14 @@ run_ops(mrb_state *mrb, mrb_value ops,
         mrb_int end_pc = mrb_integer(f[2]);
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!section_truthy(mrb, v)) {
+          /* The body renders in the current context. Push a copy of the top
+           * frame (lookup-transparent) so this recursion is counted against
+           * MUSTACHE_MAX_DEPTH like sections are; otherwise deeply nested
+           * {{^x}} recurses unbounded in C and overflows the native stack. */
+          push_or_raise(mrb, stack, depth, stack[*depth - 1]);
           run_ops(mrb, ops, pc + 1, end_pc, stack, depth,
                   partials, partial_depth, ind, out);
+          (*depth)--;
         }
         pc = end_pc;
         break;
@@ -1012,6 +1022,23 @@ template_compile(mrb_state *mrb, mrb_value self)
   return mrb_obj_new(mrb, mrb_class_ptr(self), 1, &src);
 }
 
+struct render_args {
+  mrb_value  ops;
+  mrb_value *stack;
+  mrb_int   *depth;
+  mrb_value  partials;
+  outbuf_t  *out;
+};
+
+static mrb_value
+render_body(mrb_state *mrb, void *ud)
+{
+  struct render_args *a = (struct render_args *)ud;
+  run_ops(mrb, a->ops, 0, RARRAY_LEN(a->ops), a->stack, a->depth,
+          a->partials, 0, NULL, a->out);
+  return mrb_nil_value();
+}
+
 static mrb_value
 template_render(mrb_state *mrb, mrb_value self)
 {
@@ -1022,6 +1049,11 @@ template_render(mrb_state *mrb, mrb_value self)
   }
 
   mrb_value ops = mrb_iv_get(mrb, self, MRB_SYM(ops));
+  if (!mrb_array_p(ops)) {
+    mrb_raise(mrb, RENDER_ERR(mrb),
+              "uninitialized Mustache::Template (use .new or .compile)");
+  }
+
   mrb_value stack[MUSTACHE_MAX_DEPTH];
   mrb_int depth = 0;
   stack[depth++] = ctx;
@@ -1030,7 +1062,27 @@ template_render(mrb_state *mrb, mrb_value self)
   outbuf_t out;
   outbuf_init(&out, stackbuf, sizeof(stackbuf));
 
-  run_ops(mrb, ops, 0, RARRAY_LEN(ops), stack, &depth, partials, 0, NULL, &out);
+  /* run_ops can raise (e.g. a context value's to_s), and once the buffer is
+   * promoted it is pinned with mrb_gc_register; a bare longjmp would skip
+   * outbuf_finalize's matching unregister and leak it from the global root
+   * set. mrb_protect_error runs the body behind its own jmpbuf and returns
+   * normally with an error flag, so cleanup here is well-defined. */
+  struct render_args args = { ops, stack, &depth, partials, &out };
+  mrb_bool error = FALSE;
+  mrb_value exc = mrb_protect_error(mrb, render_body, &args, &error);
+  if (error) {
+    if (!mrb_undef_p(out.heap_str)) {
+      mrb_gc_unregister(mrb, out.heap_str);
+    }
+    mrb_exc_raise(mrb, exc);
+  }
+
+  /* mrb_protect_error restored the arena past the promoted buffer; re-root it
+   * (still gc-registered, so this can't collect it) before outbuf_finalize
+   * drops the registration and returns it. */
+  if (!mrb_undef_p(out.heap_str)) {
+    mrb_gc_protect(mrb, out.heap_str);
+  }
   return outbuf_finalize(mrb, &out);
 }
 
@@ -1041,6 +1093,10 @@ template_tags(mrb_state *mrb, mrb_value self)
     return mrb_iv_get(mrb, self, MRB_SYM(tags));
   }
   mrb_value ops = mrb_iv_get(mrb, self, MRB_SYM(ops));
+  if (!mrb_array_p(ops)) {
+    mrb_raise(mrb, RENDER_ERR(mrb),
+              "uninitialized Mustache::Template (use .new or .compile)");
+  }
   mrb_value tags = mrb_ary_new(mrb);
   mrb_value seen = mrb_hash_new(mrb);
   mrb_int n = RARRAY_LEN(ops);
