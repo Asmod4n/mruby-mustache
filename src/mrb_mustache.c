@@ -9,7 +9,6 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/error.h>
-#include <mruby/gc.h>
 #include <mruby/presym.h>
 #include <mruby/internal.h>
 #include <string.h>
