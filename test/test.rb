@@ -60,6 +60,32 @@ assert('raise in to_s after buffer promotion does not corrupt or leak state') do
   assert_equal 70_000, Mustache.mustache('{{x}}', { 'x' => big.new }).length
 end
 
+assert('a template with many tags compiles without exhausting the GC arena') do
+  # tokenize/strip_standalone/link_ops build one op per tag inside a single
+  # C frame - no mruby call runs in between, so the VM never restores the
+  # arena for them. Without a per-iteration restore the arena grows by
+  # O(tags) and MRB_GC_FIXED_ARENA raised NoMemoryError from 40 tags on.
+  many = (0...2000).map { |i| "{{v#{i}}}" }.join
+  assert_equal 2000, Mustache::Template.compile(many).tags.size
+  assert_equal 60, Mustache::Template.compile(
+    (0...60).map { |i| "{{\#s#{i}}}x{{/s#{i}}}" }.join
+  ).tags.size
+  assert_equal 'ab', Mustache.mustache('{{a}}{{b}}', { 'a' => 'a', 'b' => 'b' })
+end
+
+assert('many non-String values in one render survive a buffer resize') do
+  # A value that is not a String is stringified into a fresh object that only
+  # the arena holds. outbuf_append restores the arena when it grows the heap
+  # buffer, and used to roll back past that string - the escape then read
+  # freed memory (heap-use-after-free under ASan + MRB_GC_STRESS).
+  v = Class.new { def to_s; '<x&y>' * 5; end }
+  n = 300
+  out = Mustache::Template.compile('{{v}}' * n).render({ 'v' => v.new })
+  assert_equal '&lt;x&amp;y&gt;' * 5 * n, out
+  raw = Mustache::Template.compile('{{{v}}}' * n).render({ 'v' => v.new })
+  assert_equal '<x&y>' * 5 * n, raw
+end
+
 # ---- key shapes ----------------------------------------------------------
 
 assert('symbol keys') do
