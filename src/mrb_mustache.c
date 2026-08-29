@@ -9,6 +9,7 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/error.h>
+#include <mruby/gc.h>
 #include <mruby/presym.h>
 #include <mruby/internal.h>
 #include <string.h>
@@ -299,9 +300,15 @@ static int
 hlk_match(mrb_state *mrb, mrb_value key, mrb_value val, void *data)
 {
   struct hlk_ctx *c = (struct hlk_ctx *)data;
+  /* A key that is not a String is stringified into a fresh object. Only
+   * the arena holds it, and the walk visits every key, so without the
+   * restore one lookup costs O(keys) arena slots. */
+  int ai = mrb_gc_arena_save(mrb);
   mrb_value s = mrb_obj_as_string(mrb, key);
-  if (RSTRING_LEN(s) == c->name_len &&
-      memcmp(RSTRING_PTR(s), c->name, (size_t)c->name_len) == 0) {
+  int hit = (RSTRING_LEN(s) == c->name_len &&
+             memcmp(RSTRING_PTR(s), c->name, (size_t)c->name_len) == 0);
+  mrb_gc_arena_restore(mrb, ai);
+  if (hit) {
     c->result = val;
     c->found = 1;
     return 1;
@@ -425,7 +432,9 @@ render_section(mrb_state *mrb, mrb_value ops,
      * this same array, freeing the backing buffer (heap-use-after-free). The
      * length is snapshotted so growth during iteration can't loop unbounded;
      * mrb_ary_ref returns nil for indices the array no longer has. */
+    int ai = mrb_gc_arena_save(mrb);
     for (mrb_int i = 0; i < n; i++) {
+      mrb_gc_arena_restore(mrb, ai);
       mrb_value elem = mrb_ary_ref(mrb, v, i);
       push_or_raise(mrb, stack, depth, elem);
       run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out);
@@ -503,8 +512,13 @@ run_ops(mrb_state *mrb, mrb_value ops,
         mrb_value k = f[1];
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!mrb_nil_p(v)) {
+          int idx = mrb_gc_arena_save(mrb);
+          int mark = out->arena_index;
           mrb_value s = mrb_obj_as_string(mrb, v);
+          out->arena_index = mrb_gc_arena_save(mrb);
           escape_html_value(mrb, out, ind, RSTRING_PTR(s), RSTRING_LEN(s));
+          out->arena_index = mark;
+          mrb_gc_arena_restore(mrb, idx);
         }
         pc++;
         break;
@@ -513,8 +527,13 @@ run_ops(mrb_state *mrb, mrb_value ops,
         mrb_value k = f[1];
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!mrb_nil_p(v)) {
+          int idx = mrb_gc_arena_save(mrb);
+          int mark = out->arena_index;
           mrb_value s = mrb_obj_as_string(mrb, v);
+          out->arena_index = mrb_gc_arena_save(mrb);
           emit_value_bytes(mrb, out, ind, RSTRING_PTR(s), RSTRING_LEN(s));
+          out->arena_index = mark;
+          mrb_gc_arena_restore(mrb, idx);
         }
         pc++;
         break;
@@ -665,7 +684,16 @@ tokenize(mrb_state *mrb, mrb_value src)
   mrb_int sz = RSTRING_LEN(src);
   mrb_int pos = 0;
 
+  /* Taken after ops exists, so ops itself sits below the mark and
+   * survives every restore. Each op is rooted by ops the moment it is
+   * pushed; the slices and part arrays behind it need no arena slot of
+   * their own past the end of the iteration that made them. Without the
+   * restore the arena grows by O(tags) and a fixed-arena build
+   * (MRB_GC_FIXED_ARENA) raises NoMemoryError at 40 tags. */
+  int ai = mrb_gc_arena_save(mrb);
+
   while (pos < sz) {
+    mrb_gc_arena_restore(mrb, ai);
     /* Re-fetch each iteration: mrb_str_byte_subseq (called directly
      * below and indirectly via parse_key/strip_name) triggers str_share
      * on the first invocation, which reallocs src's buffer to shrink
@@ -765,7 +793,12 @@ strip_standalone(mrb_state *mrb, mrb_value ops)
   mrb_int line_start_op = 0;
   mrb_int line_start_inset = 0;
 
+  /* ops is the caller's array and is rooted there; every replacement op
+   * is stored into it before the restore. See tokenize for why. */
+  int ai = mrb_gc_arena_save(mrb);
+
   while (line_start_op < RARRAY_LEN(ops)) {
+    mrb_gc_arena_restore(mrb, ai);
     mrb_int n = RARRAY_LEN(ops);
 
     mrb_int end_op = -1, end_inset = -1;
@@ -934,7 +967,13 @@ link_ops(mrb_state *mrb, mrb_value tokens)
   mrb_value stk = mrb_ary_new(mrb);
   mrb_int n = RARRAY_LEN(tokens);
 
+  /* Taken after out and stk exist: both stay live across the restores,
+   * and everything made inside an iteration is reachable from one of
+   * them by the time the next restore runs. See tokenize. */
+  int ai = mrb_gc_arena_save(mrb);
+
   for (mrb_int i = 0; i < n; i++) {
+    mrb_gc_arena_restore(mrb, ai);
     mrb_value op = mrb_ary_ref(mrb, tokens, i);
     mrb_int tag = op_tag(mrb, op);
 
@@ -1100,7 +1139,11 @@ template_tags(mrb_state *mrb, mrb_value self)
   mrb_value tags = mrb_ary_new(mrb);
   mrb_value seen = mrb_hash_new(mrb);
   mrb_int n = RARRAY_LEN(ops);
+  /* Taken after tags and seen exist; a label that is kept is stored in
+   * both before the next restore. See tokenize. */
+  int ai = mrb_gc_arena_save(mrb);
   for (mrb_int i = 0; i < n; i++) {
+    mrb_gc_arena_restore(mrb, ai);
     mrb_value op = mrb_ary_ref(mrb, ops, i);
     mrb_int t = op_tag(mrb, op);
     if (t == OP_VAR || t == OP_RAW || t == OP_SECTION || t == OP_INVERTED) {
