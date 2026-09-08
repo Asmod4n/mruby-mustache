@@ -10,7 +10,6 @@
 #include <mruby/variable.h>
 #include <mruby/error.h>
 #include <mruby/presym.h>
-#include <mruby/internal.h>
 #include <string.h>
 
 #ifndef MUSTACHE_OUTBUF_STACK
