@@ -6,6 +6,7 @@
 #include <mruby/array.h>
 #include <mruby/class.h>
 #include <mruby/hash.h>
+#include <mruby/numeric.h>
 #include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/error.h>
@@ -331,11 +332,11 @@ ctx_lookup(mrb_state *mrb, mrb_value *stack, mrb_int depth, mrb_value key)
   mrb_int klen = RARRAY_LEN(key);
   if (klen == 0) return stack[depth - 1];
 
-  /* Key arrays are built in parse_key and frozen by convention (never
-   * mutated post-compile). Direct pointer access is safe; we read each
-   * segment fresh inside the loop in case GC touches things we don't see. */
-  mrb_value *kp = RARRAY_PTR(key);
-  mrb_value first = kp[0];
+  /* mrb_ary_ref, never RARRAY_PTR: hash_lookup_str below calls
+   * mrb_obj_as_string on every key it walks, which runs Ruby, and a
+   * backing pointer taken before that call describes the array as it was
+   * before it. The accessor re-reads and bounds-checks each time. */
+  mrb_value first = mrb_ary_ref(mrb, key, 0);
 
   mrb_value base = mrb_nil_value();
   int found = 0;
@@ -348,7 +349,7 @@ ctx_lookup(mrb_state *mrb, mrb_value *stack, mrb_int depth, mrb_value key)
 
   for (mrb_int j = 1; j < klen; j++) {
     if (mrb_nil_p(base) || !mrb_hash_p(base)) return mrb_nil_value();
-    mrb_value seg = kp[j];
+    mrb_value seg = mrb_ary_ref(mrb, key, j);
     base = hash_lookup_str(mrb, base, seg);
     if (mrb_nil_p(base)) return mrb_nil_value();
   }
@@ -399,18 +400,75 @@ section_truthy(mrb_state *mrb, mrb_value v)
   return 1;
 }
 
+/* What one render holds on to.
+ *
+ * roots: every ops array the render walks - the template's own and each
+ * partial's. mruby's GC does not scan the C stack, so an ops array whose
+ * only other reference is the caller's partials Hash dies the moment a
+ * value's to_s removes it from that Hash. One registered array roots
+ * them all, and template_render releases it on both ways out.
+ *
+ * thawed: every caller array this render froze. An array is frozen while
+ * it is walked, so Ruby called from a to_s cannot grow, shrink or
+ * replace it underneath the walk. An array the caller had already frozen
+ * is not listed here - it is not ours to thaw. */
+typedef struct {
+  mrb_value roots;
+  mrb_value thawed;
+} render_keep;
+
 static void run_ops(mrb_state *mrb, mrb_value ops,
                     mrb_int pc, mrb_int stop,
                     mrb_value *stack, mrb_int *depth,
                     mrb_value partials, int partial_depth,
-                    indent_t *ind, outbuf_t *out);
+                    indent_t *ind, outbuf_t *out, render_keep *keep);
+
+/* Freeze for the length of the walk, and say whether this call is the
+ * one that froze it. mruby's frozen flag is a bit on RBasic and its own
+ * class.c clears it the same way. */
+static int
+keep_freeze(mrb_state *mrb, render_keep *keep, mrb_value v)
+{
+  if (mrb_frozen_p(mrb_basic_ptr(v))) return 0;
+  mrb_obj_freeze(mrb, v);
+  mrb_ary_push(mrb, keep->thawed, v);
+  return 1;
+}
 
 static void
-push_or_raise(mrb_state *mrb, mrb_value *stack, mrb_int *depth, mrb_value v)
+keep_thaw_all(mrb_state *mrb, render_keep *keep)
+{
+  mrb_int n = RARRAY_LEN(keep->thawed);
+  for (mrb_int i = 0; i < n; i++) {
+    mrb_value v = mrb_ary_ref(mrb, keep->thawed, i);
+    if (!mrb_nil_p(v)) mrb_basic_ptr(v)->frozen = 0;
+  }
+  mrb_ary_resize(mrb, keep->thawed, 0);
+}
+
+/* Every context frame arrives here, so this is where a binding is closed
+ * for the length of the render.
+ *
+ * A Hash and an Array are frozen; anything else is left alone. The two
+ * are what the lookup reads structurally - ctx_lookup indexes them, and
+ * an answer that changed between one tag and the next is an answer to a
+ * question nobody asked. Every other kind of value is opaque here: the
+ * render only ever calls to_s on it, and what that does to its own
+ * insides cannot move anything this code is reading. Freezing those
+ * would break an ordinary `@cache ||= ...` in a caller's to_s.
+ *
+ * mrb_hash_foreach refuses a Hash that changes while it walks it, but it
+ * only sees one walk. A value's to_s runs between two walks, where that
+ * guard cannot reach - so the flag, not the callback, is what makes a
+ * binding hold still. */
+static void
+push_or_raise(mrb_state *mrb, mrb_value *stack, mrb_int *depth, mrb_value v,
+              render_keep *keep)
 {
   if (*depth >= MUSTACHE_MAX_DEPTH) {
     mrb_raise(mrb, RENDER_ERR(mrb), "max nesting depth exceeded");
   }
+  if (mrb_hash_p(v) || mrb_array_p(v)) keep_freeze(mrb, keep, v);
   stack[*depth] = v;
   (*depth)++;
 }
@@ -420,7 +478,7 @@ render_section(mrb_state *mrb, mrb_value ops,
                mrb_int pc, mrb_int stop,
                mrb_value *stack, mrb_int *depth,
                mrb_value partials, int partial_depth,
-               indent_t *ind, outbuf_t *out, mrb_value v)
+               indent_t *ind, outbuf_t *out, mrb_value v, render_keep *keep)
 {
   if (mrb_array_p(v)) {
     mrb_int n = RARRAY_LEN(v);
@@ -430,27 +488,34 @@ render_section(mrb_state *mrb, mrb_value ops,
      * this same array, freeing the backing buffer (heap-use-after-free). The
      * length is snapshotted so growth during iteration can't loop unbounded;
      * mrb_ary_ref returns nil for indices the array no longer has. */
+    /* Frozen while it is walked: an element's to_s runs Ruby, and Ruby
+     * that pushes onto or replaces this array would move the elements
+     * under the walk. Frozen, that attempt raises in the caller's own
+     * code, where it can be read, instead of corrupting the render.
+     * The previous flag is restored by keep_thaw_all - an array the
+     * caller had already frozen is not listed and not touched. */
+    keep_freeze(mrb, keep, v);
     int ai = mrb_gc_arena_save(mrb);
     for (mrb_int i = 0; i < n; i++) {
       mrb_gc_arena_restore(mrb, ai);
       mrb_value elem = mrb_ary_ref(mrb, v, i);
-      push_or_raise(mrb, stack, depth, elem);
-      run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out);
+      push_or_raise(mrb, stack, depth, elem, keep);
+      run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out, keep);
       (*depth)--;
     }
   }
   else if (mrb_hash_p(v)) {
     if (mrb_hash_empty_p(mrb, v)) return;
-    push_or_raise(mrb, stack, depth, v);
-    run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out);
+    push_or_raise(mrb, stack, depth, v, keep);
+    run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out, keep);
     (*depth)--;
   }
   else if (mrb_nil_p(v) || mrb_false_p(v)) {
     /* skip */
   }
   else {
-    push_or_raise(mrb, stack, depth, v);
-    run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out);
+    push_or_raise(mrb, stack, depth, v, keep);
+    run_ops(mrb, ops, pc, stop, stack, depth, partials, partial_depth, ind, out, keep);
     (*depth)--;
   }
 }
@@ -459,7 +524,7 @@ static void
 render_partial(mrb_state *mrb, mrb_value name, mrb_value indent_str,
                mrb_value *stack, mrb_int *depth,
                mrb_value partials, int partial_depth,
-               indent_t *outer_ind, outbuf_t *out)
+               indent_t *outer_ind, outbuf_t *out, render_keep *keep)
 {
   if (!mrb_hash_p(partials)) return;
   if (partial_depth >= MUSTACHE_MAX_PARTIAL_DEPTH) {
@@ -467,47 +532,60 @@ render_partial(mrb_state *mrb, mrb_value name, mrb_value indent_str,
   }
   mrb_value tmpl = hash_lookup_str(mrb, partials, name);
   if (!mrb_obj_is_kind_of(mrb, tmpl, template_class(mrb))) return;
+  /* The Hash entry is the only reference to tmpl, and mruby's GC never
+   * sees the C locals that hold it or its ops array. Root it for as long
+   * as this call walks it, and no longer: a partial inside a section runs
+   * once per element, and a root left behind per element would grow with
+   * the caller's data rather than with the nesting. `held` is where this
+   * call found the list, and the resize below gives it back. A raise
+   * skips that, which costs nothing - template_render drops the whole
+   * holder on that path. */
+  mrb_int held = RARRAY_LEN(keep->roots);
+  mrb_ary_push(mrb, keep->roots, tmpl);
   mrb_value sub = mrb_iv_get(mrb, tmpl, MRB_SYM(ops));
 
   if (outer_ind) emit_indent_if_pending(mrb, out, outer_ind);
 
   if (RSTRING_LEN(indent_str) == 0) {
     run_ops(mrb, sub, 0, RARRAY_LEN(sub), stack, depth,
-            partials, partial_depth + 1, outer_ind, out);
+            partials, partial_depth + 1, outer_ind, out, keep);
+    mrb_ary_resize(mrb, keep->roots, held);
     return;
   }
 
   indent_t ind = { RSTRING_PTR(indent_str), RSTRING_LEN(indent_str), 1 };
   run_ops(mrb, sub, 0, RARRAY_LEN(sub), stack, depth,
-          partials, partial_depth + 1, &ind, out);
+          partials, partial_depth + 1, &ind, out, keep);
+  mrb_ary_resize(mrb, keep->roots, held);
 }
 
-/* run_ops trusts op shape — validated once in link_ops, never re-checked
- * here. ops_arr cached at function entry; per-iteration f cached after
- * pc bounds check. f[1], f[2] read directly: validated to exist. */
+/* link_ops validated the shape of every op, so the arity of each field is
+ * known here. What is not known is where the array lives: OP_VAR and
+ * OP_RAW call mrb_obj_as_string, which runs Ruby, and Ruby allocates.
+ * So every read goes through mrb_ary_ref - it re-reads the array and
+ * bounds-checks the index - and never through a backing pointer taken
+ * before the call. `keep` roots this ops array and every partial's for
+ * the length of the render; see template_render. */
 static void
 run_ops(mrb_state *mrb, mrb_value ops,
         mrb_int pc, mrb_int stop,
         mrb_value *stack, mrb_int *depth,
         mrb_value partials, int partial_depth,
-        indent_t *ind, outbuf_t *out)
+        indent_t *ind, outbuf_t *out, render_keep *keep)
 {
-  mrb_value *ops_arr = RARRAY_PTR(ops);
-
   while (pc < stop) {
-    mrb_value op = ops_arr[pc];
-    mrb_value *f = RARRAY_PTR(op);
-    mrb_int tag = mrb_integer(f[0]);
+    mrb_value op = mrb_ary_ref(mrb, ops, pc);
+    mrb_int tag = mrb_integer(mrb_ary_ref(mrb, op, 0));
 
     switch (tag) {
       case OP_TEXT: {
-        mrb_value t = f[1];
+        mrb_value t = mrb_ary_ref(mrb, op, 1);
         emit_text_bytes(mrb, out, ind, RSTRING_PTR(t), RSTRING_LEN(t));
         pc++;
         break;
       }
       case OP_VAR: {
-        mrb_value k = f[1];
+        mrb_value k = mrb_ary_ref(mrb, op, 1);
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!mrb_nil_p(v)) {
           int idx = mrb_gc_arena_save(mrb);
@@ -522,7 +600,7 @@ run_ops(mrb_state *mrb, mrb_value ops,
         break;
       }
       case OP_RAW: {
-        mrb_value k = f[1];
+        mrb_value k = mrb_ary_ref(mrb, op, 1);
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!mrb_nil_p(v)) {
           int idx = mrb_gc_arena_save(mrb);
@@ -537,36 +615,36 @@ run_ops(mrb_state *mrb, mrb_value ops,
         break;
       }
       case OP_SECTION: {
-        mrb_value k = f[1];
-        mrb_int end_pc = mrb_integer(f[2]);
+        mrb_value k = mrb_ary_ref(mrb, op, 1);
+        mrb_int end_pc = mrb_integer(mrb_ary_ref(mrb, op, 2));
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         render_section(mrb, ops, pc + 1, end_pc, stack, depth,
-                       partials, partial_depth, ind, out, v);
+                       partials, partial_depth, ind, out, v, keep);
         pc = end_pc;
         break;
       }
       case OP_INVERTED: {
-        mrb_value k = f[1];
-        mrb_int end_pc = mrb_integer(f[2]);
+        mrb_value k = mrb_ary_ref(mrb, op, 1);
+        mrb_int end_pc = mrb_integer(mrb_ary_ref(mrb, op, 2));
         mrb_value v = ctx_lookup(mrb, stack, *depth, k);
         if (!section_truthy(mrb, v)) {
           /* The body renders in the current context. Push a copy of the top
            * frame (lookup-transparent) so this recursion is counted against
            * MUSTACHE_MAX_DEPTH like sections are; otherwise deeply nested
            * {{^x}} recurses unbounded in C and overflows the native stack. */
-          push_or_raise(mrb, stack, depth, stack[*depth - 1]);
+          push_or_raise(mrb, stack, depth, stack[*depth - 1], keep);
           run_ops(mrb, ops, pc + 1, end_pc, stack, depth,
-                  partials, partial_depth, ind, out);
+                  partials, partial_depth, ind, out, keep);
           (*depth)--;
         }
         pc = end_pc;
         break;
       }
       case OP_PARTIAL: {
-        mrb_value name   = f[1];
-        mrb_value indent = f[2];
+        mrb_value name   = mrb_ary_ref(mrb, op, 1);
+        mrb_value indent = mrb_ary_ref(mrb, op, 2);
         render_partial(mrb, name, indent, stack, depth,
-                       partials, partial_depth, ind, out);
+                       partials, partial_depth, ind, out, keep);
         pc++;
         break;
       }
@@ -1024,6 +1102,30 @@ link_ops(mrb_state *mrb, mrb_value tokens)
   }
 
   validate_ops_shape(mrb, out);
+
+  /* Nothing changes an op after this point, so say it to the VM rather
+   * than to the reader. Frozen, the arrays run_ops walks cannot be grown
+   * or replaced by any Ruby the render calls, which is what makes an
+   * index read of them sound. The keys and text are frozen with them:
+   * hash_lookup_str compares against a key's bytes while running to_s on
+   * whatever it is comparing to. */
+  mrb_int fn = RARRAY_LEN(out);
+  for (mrb_int i = 0; i < fn; i++) {
+    mrb_value op = mrb_ary_ref(mrb, out, i);
+    mrb_int fields = RARRAY_LEN(op);
+    for (mrb_int j = 1; j < fields; j++) {
+      mrb_value field = mrb_ary_ref(mrb, op, j);
+      if (mrb_array_p(field)) {
+        mrb_int kn = RARRAY_LEN(field);
+        for (mrb_int k = 0; k < kn; k++) {
+          mrb_obj_freeze(mrb, mrb_ary_ref(mrb, field, k));
+        }
+      }
+      if (mrb_array_p(field) || mrb_string_p(field)) mrb_obj_freeze(mrb, field);
+    }
+    mrb_obj_freeze(mrb, op);
+  }
+  mrb_obj_freeze(mrb, out);
   return out;
 }
 
@@ -1060,11 +1162,12 @@ template_compile(mrb_state *mrb, mrb_value self)
 }
 
 struct render_args {
-  mrb_value  ops;
-  mrb_value *stack;
-  mrb_int   *depth;
-  mrb_value  partials;
-  outbuf_t  *out;
+  mrb_value    ops;
+  mrb_value   *stack;
+  mrb_int     *depth;
+  mrb_value    partials;
+  outbuf_t    *out;
+  render_keep *keep;
 };
 
 static mrb_value
@@ -1072,7 +1175,7 @@ render_body(mrb_state *mrb, void *ud)
 {
   struct render_args *a = (struct render_args *)ud;
   run_ops(mrb, a->ops, 0, RARRAY_LEN(a->ops), a->stack, a->depth,
-          a->partials, 0, NULL, a->out);
+          a->partials, 0, NULL, a->out, a->keep);
   return mrb_nil_value();
 }
 
@@ -1104,9 +1207,31 @@ template_render(mrb_state *mrb, mrb_value self)
    * outbuf_finalize's matching unregister and leak it from the global root
    * set. mrb_protect_error runs the body behind its own jmpbuf and returns
    * normally with an error flag, so cleanup here is well-defined. */
-  struct render_args args = { ops, stack, &depth, partials, &out };
+  /* One registered holder for both: the ops arrays this render walks,
+   * and the caller arrays it froze. Registered rather than left to the
+   * arena, because outbuf_append restores the arena on every write. */
+  render_keep keep;
+  keep.roots  = mrb_ary_new(mrb);
+  keep.thawed = mrb_ary_new(mrb);
+  mrb_value holder = mrb_ary_new_capa(mrb, 2);
+  mrb_ary_push(mrb, holder, keep.roots);
+  mrb_ary_push(mrb, holder, keep.thawed);
+  mrb_gc_register(mrb, holder);
+  mrb_ary_push(mrb, keep.roots, ops);
+
+  /* The two bindings that never pass through push_or_raise: the root
+   * context, which is written straight into stack[0], and the partials
+   * Hash, which hash_lookup_str walks on every {{>name}}. */
+  if (mrb_hash_p(ctx) || mrb_array_p(ctx)) keep_freeze(mrb, &keep, ctx);
+  if (mrb_hash_p(partials)) keep_freeze(mrb, &keep, partials);
+
+  struct render_args args = { ops, stack, &depth, partials, &out, &keep };
   mrb_bool error = FALSE;
   mrb_value exc = mrb_protect_error(mrb, render_body, &args, &error);
+  /* Both ways out give the caller's arrays back. A raise takes this path
+   * too, so a to_s that blew up does not leave a frozen array behind. */
+  keep_thaw_all(mrb, &keep);
+  mrb_gc_unregister(mrb, holder);
   if (error) {
     if (!mrb_undef_p(out.heap_str)) {
       mrb_gc_unregister(mrb, out.heap_str);
@@ -1157,6 +1282,35 @@ template_tags(mrb_state *mrb, mrb_value self)
   return tags;
 }
 
+/* A Template is a plain object with no to_s, and that is the one shape
+ * mrb_obj_inspect walks the instance variables of - see mrb_obj_basic_to_s_p
+ * in src/kernel.c. Without this, `p template` and any error message that
+ * names one print the whole template source and the entire compiled
+ * program. The slots carry names MRB_SYM gives them rather than MRB_IVSYM,
+ * so instance_variables and instance_variable_get cannot reach them, but
+ * inspect walks the table itself and does not care.
+ *
+ * What is worth seeing is the size, so that is what this says. */
+static mrb_value
+template_inspect(mrb_state *mrb, mrb_value self)
+{
+  mrb_value ops = mrb_iv_get(mrb, self, MRB_SYM(ops));
+  mrb_value out = mrb_str_new_lit(mrb, "#<");
+  mrb_str_cat_cstr(mrb, out, mrb_obj_classname(mrb, self));
+  mrb_str_cat_lit(mrb, out, ":");
+  mrb_str_cat_str(mrb, out, mrb_ptr_to_str(mrb, mrb_obj_ptr(self)));
+  if (mrb_array_p(ops)) {
+    mrb_str_cat_lit(mrb, out, " ");
+    mrb_str_cat_str(mrb, out, mrb_integer_to_str(mrb, mrb_int_value(mrb, RARRAY_LEN(ops)), 10));
+    mrb_str_cat_lit(mrb, out, " ops");
+  }
+  else {
+    mrb_str_cat_lit(mrb, out, " uncompiled");
+  }
+  mrb_str_cat_lit(mrb, out, ">");
+  return out;
+}
+
 static mrb_value
 mustache_one_shot(mrb_state *mrb, mrb_value self)
 {
@@ -1193,6 +1347,7 @@ mrb_mruby_mustache_gem_init(mrb_state *mrb)
   mrb_define_class_method_id(mrb, tmpl, MRB_SYM(compile), template_compile, MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, tmpl, MRB_SYM(render), template_render, MRB_ARGS_OPT(2));
   mrb_define_method_id(mrb, tmpl, MRB_SYM(tags),   template_tags,   MRB_ARGS_NONE());
+  mrb_define_method_id(mrb, tmpl, MRB_SYM(inspect), template_inspect, MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, m, MRB_SYM(mustache), mustache_one_shot, MRB_ARGS_ARG(1, 2));
 }
 

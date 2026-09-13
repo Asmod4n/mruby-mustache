@@ -27,11 +27,19 @@ fi
 FUZZ_DIR="$ROOT/fuzz"
 mkdir -p "$FUZZ_DIR"
 
+# Everything this script builds lands under mruby/, which .gitignore
+# already covers in full. Only the sources and the corpus live in fuzz/
+# and belong in a commit; the binary and the generated build config are
+# this machine's and nobody else's - the config even carries an absolute
+# path to this checkout.
+OUT_DIR="$ROOT/mruby/build/fuzz"
+FUZZ_BIN="$OUT_DIR/fuzz_mustache"
+BUILD_CONFIG="$OUT_DIR/build_config.rb"
+
 # --- clean -----------------------------------------------------------------
 
 if [ "${1:-}" = "clean" ]; then
-  rm -rf "$FUZZ_DIR/fuzz_mustache" "$FUZZ_DIR/corpus" "$FUZZ_DIR/build_config.rb" \
-         "$FUZZ_DIR/mustache.dict" "$FUZZ_DIR/fuzz_mustache.c" \
+  rm -rf "$FUZZ_DIR/corpus" "$FUZZ_DIR/mustache.dict" "$FUZZ_DIR/fuzz_mustache.c" \
          "$ROOT/mruby/build/fuzz" 2>/dev/null || true
   rm -f "$ROOT"/crash-* "$ROOT"/leak-* "$ROOT"/oom-* "$ROOT"/timeout-* 2>/dev/null || true
   echo "cleaned."
@@ -221,7 +229,8 @@ write_seed indent_part   $'  {{>p}}\n'                                'x'
 
 # --- write build config ----------------------------------------------------
 
-cat > "$FUZZ_DIR/build_config.rb" <<RUBY_EOF
+mkdir -p "$OUT_DIR"
+cat > "$BUILD_CONFIG" <<RUBY_EOF
 MRuby::Build.new('fuzz') do |conf|
   toolchain :clang
   conf.gembox 'default'
@@ -240,7 +249,7 @@ export CFLAGS="$SAN"
 export LDFLAGS="$SAN"
 
 echo "===> building mruby with libfuzzer + asan + ubsan"
-( cd "$ROOT/mruby" && rake MRUBY_CONFIG="$FUZZ_DIR/build_config.rb" )
+( cd "$ROOT/mruby" && rake MRUBY_CONFIG="$BUILD_CONFIG" )
 
 LIBMRUBY="$ROOT/mruby/build/fuzz/lib/libmruby.a"
 if [ ! -f "$LIBMRUBY" ]; then
@@ -254,12 +263,12 @@ echo "===> linking harness"
   -fno-omit-frame-pointer -g -O1 \
   -I "$ROOT/mruby/include" \
   -I "$ROOT/mruby/build/fuzz/include" \
-  -o "$FUZZ_DIR/fuzz_mustache" \
+  -o "$FUZZ_BIN" \
   "$FUZZ_DIR/fuzz_mustache.c" \
   "$LIBMRUBY" \
   -lm
 
-echo "built: $FUZZ_DIR/fuzz_mustache"
+echo "built: $FUZZ_BIN"
 
 # --- run -------------------------------------------------------------------
 
@@ -273,7 +282,7 @@ cd "$ROOT"
 if [ -n "${1:-}" ] && [ "$1" -eq "$1" ] 2>/dev/null; then
   TIME_LIMIT="$1"
   echo "===> fuzzing for ${TIME_LIMIT}s"
-  exec "$FUZZ_DIR/fuzz_mustache" \
+  exec "$FUZZ_BIN" \
     "$FUZZ_DIR/corpus" \
     -dict="$FUZZ_DIR/mustache.dict" \
     -max_total_time="$TIME_LIMIT" \
@@ -281,7 +290,7 @@ if [ -n "${1:-}" ] && [ "$1" -eq "$1" ] 2>/dev/null; then
     -rss_limit_mb=2048
 else
   echo "===> fuzzing (forever — Ctrl-C to stop)"
-  exec "$FUZZ_DIR/fuzz_mustache" \
+  exec "$FUZZ_BIN" \
     "$FUZZ_DIR/corpus" \
     -dict="$FUZZ_DIR/mustache.dict" \
     -rss_limit_mb=2048

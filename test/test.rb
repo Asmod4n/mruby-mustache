@@ -35,16 +35,100 @@ assert('deeply nested inverted sections raise, not overflow the C stack') do
   assert_raise(Mustache::RenderError) { t.render({}) }   # key absent => bodies render
 end
 
-assert('section array mutated by an element to_s does not use-after-free') do
+assert('an element to_s that mutates the section array is refused, not tolerated') do
   mutator = Class.new do
     def initialize(arr); @arr = arr; end
-    def to_s; 64.times { @arr << 'x' }; 'e'; end   # realloc the array mid-iteration
+    def to_s; 64.times { @arr << 'x' }; 'e'; end   # would realloc mid-iteration
   end
   arr = []
   16.times { arr << mutator.new(arr) }
-  # Snapshotted length + bounds-checked element access must keep this safe.
-  out = Mustache.mustache('{{#arr}}{{.}}{{/arr}}', { 'arr' => arr })
-  assert_equal 16, out.length   # only the original 16 elements are rendered
+  # The array is frozen while it is walked, so the attempt raises in the
+  # caller's own code, where it can be read and fixed. It used to be
+  # tolerated - the walk snapshotted the length and rendered the first 16
+  # - which silently threw away what the caller thought it had added.
+  assert_raise(FrozenError) { Mustache.mustache('{{#arr}}{{.}}{{/arr}}', { 'arr' => arr }) }
+  # The flag is given back, whichever way the render left.
+  assert_false arr.frozen?
+end
+
+assert('a section array keeps the frozen flag it arrived with') do
+  thawed = %w[a b]
+  assert_equal 'ab', Mustache.mustache('{{#arr}}{{.}}{{/arr}}', { 'arr' => thawed })
+  assert_false thawed.frozen?
+
+  already = %w[a b].freeze
+  assert_equal 'ab', Mustache.mustache('{{#arr}}{{.}}{{/arr}}', { 'arr' => already })
+  assert_true already.frozen?
+end
+
+assert('a to_s cannot drop the partial it is being rendered inside') do
+  # render_partial reads the sub-template's ops out of a Template held only
+  # by the caller's Hash, and mruby's GC does not scan the C stack. Deleting
+  # that entry from a to_s used to free the array mid-walk: SIGSEGV, or
+  # "internal: unexpected op tag <garbage>". The partials Hash is a binding,
+  # so it is closed for the render and the delete is refused instead.
+  partials = { 'p' => Mustache::Template.compile('{{v}}' + '{{w}}' * 300) }
+  dropper = Class.new do
+    def initialize(h); @h = h; end
+    def to_s; @h.delete('p'); 300.times { Array.new(64) { 'pad' } }; 'gone'; end
+  end
+  outer = Mustache::Template.compile('{{>p}}')
+  assert_raise(FrozenError) do
+    outer.render({ 'v' => dropper.new(partials), 'w' => 'W' }, partials)
+  end
+  # And the Hash is the caller's again the moment the render is over.
+  assert_false partials.frozen?
+  partials.delete('p')
+  assert_equal '', outer.render({ 'v' => 'V' }, partials)
+end
+
+assert('inspect says the size, not the whole program') do
+  # A Template is a plain object with no to_s, which is the one shape
+  # mrb_obj_inspect walks the instance variables of. Untouched, `p t` and
+  # any error message naming a Template carried the entire source and the
+  # compiled ops with it.
+  t = Mustache::Template.compile('{{a}}{{#s}}{{.}}{{/s}}')
+  said = t.inspect
+  assert_false said.include?('{{a}}'), said
+  assert_false said.include?('source'), said
+  assert_true said.include?('ops'), said
+end
+
+assert('a binding is closed only for the render, and free on either side of it') do
+  ctx      = { 'a' => 'A', 'list' => %w[x y] }
+  partials = { 'p' => Mustache::Template.compile('{{a}}') }
+  t = Mustache::Template.compile('{{a}}{{#list}}{{.}}{{/list}}{{>p}}')
+
+  assert_false ctx.frozen?
+  assert_equal 'AxyA', t.render(ctx, partials)
+  # Given back after a render that finished.
+  assert_false ctx.frozen?
+  assert_false ctx['list'].frozen?
+  assert_false partials.frozen?
+  ctx['b'] = 'B'   # and writable again
+
+  # Given back after a render that raised, too.
+  boom = Class.new { def to_s; raise 'boom'; end }
+  assert_raise(RuntimeError) { t.render({ 'a' => boom.new, 'list' => [] }, partials) }
+  assert_false partials.frozen?
+
+  # A Hash the caller had already frozen keeps the flag it arrived with.
+  sealed = { 'a' => 'A', 'list' => [] }.freeze
+  assert_equal 'AA', t.render(sealed, partials)   # {{a}}, no list, then {{>p}} = {{a}}
+  assert_true sealed.frozen?
+end
+
+assert('one template renders again after a partial of it was dropped') do
+  # The keep-alive holds a partial's template for the length of one render
+  # and lets go after it. A second render must find it through the Hash
+  # again, not through a root left behind by the first.
+  sub = Mustache::Template.compile('{{v}}')
+  partials = { 'p' => sub }
+  outer = Mustache::Template.compile('{{>p}}')
+  assert_equal '1', outer.render({ 'v' => '1' }, partials)
+  assert_equal '2', outer.render({ 'v' => '2' }, partials)
+  partials.delete('p')
+  assert_equal '', outer.render({ 'v' => '3' }, partials)
 end
 
 assert('raise in to_s after buffer promotion does not corrupt or leak state') do
