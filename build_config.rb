@@ -1,5 +1,5 @@
 MRuby::Build.new do |conf|
-    toolchain :gcc
+    conf.toolchain :clang
     def for_windows?
         ('A'..'Z').to_a.any? { |vol| Dir.exist?("#{vol}:") }
     end
@@ -8,7 +8,8 @@ MRuby::Build.new do |conf|
         #conf.linker.flags_before_libraries << '-static-libasan'
     end
     #conf.cc.flags << '-fno-omit-frame-pointer' << '-g' << '-ggdb' << '-Og'
-    conf.cc.flags << '-O3' << '-march=native'
+    conf.cc.flags << '-O2' << '-march=x86-64-v3'
+    conf.cxx.flags << '-O2' << '-march=x86-64-v3'
     #conf.enable_debug
     conf.enable_test
   #conf.cc.defines  << 'MRB_UTF8_STRING'

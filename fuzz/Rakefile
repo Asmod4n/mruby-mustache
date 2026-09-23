@@ -1,0 +1,52 @@
+require 'rake'
+require 'fileutils'
+
+MRUBY_CONFIG_PATH = File.expand_path(ENV["MRUBY_CONFIG"] || "build_config.rb")
+
+file :mruby do
+  unless File.directory?('mruby')
+    sh "git clone --depth=1 https://github.com/mruby/mruby.git"
+  end
+end
+
+desc "compile binary"
+task :compile => :mruby do
+  Dir.chdir("mruby") do
+    ENV["MRUBY_CONFIG"] = MRUBY_CONFIG_PATH
+    sh "rake all"
+  end
+end
+
+desc "test"
+task :test => :mruby do
+  Dir.chdir("mruby") do
+    ENV["MRUBY_CONFIG"] = MRUBY_CONFIG_PATH
+    sh "rake all test"
+  end
+end
+
+desc "cleanup"
+task :clean do
+  Dir.chdir("mruby") do
+    ENV["MRUBY_CONFIG"] = MRUBY_CONFIG_PATH
+    sh "rake deep_clean"
+  end
+end
+
+{ corpus_merge: ['mruby-mustache-fuzzer', 'corpus'],
+  corpus_core_merge: ['mustache-core-fuzzer', 'corpus_core'] }.each do |name, (bin, dir)|
+  desc "minimize #{dir}: keep only the inputs that add coverage"
+  task name => :compile do
+    fuzzer = File.expand_path("mruby/build/host/bin/#{bin}")
+    corpus = File.expand_path(dir)
+    merged = File.expand_path("#{dir}_min")
+    FileUtils.mkdir_p(merged)
+    sh fuzzer, '-rss_limit_mb=4096', '-merge=1', merged, corpus
+    before = Dir[File.join(corpus, '*')].count
+    FileUtils.rm_rf(corpus)
+    FileUtils.mv(merged, corpus)
+    puts "#{dir}: #{before} -> #{Dir[File.join(corpus, '*')].count} inputs"
+  end
+end
+
+task :default => :test
