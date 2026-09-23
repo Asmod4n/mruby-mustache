@@ -289,7 +289,8 @@ struct Renderer {
     }
   }
 
-  static constexpr void indent_if_pending(Out &out, bool &pending)
+  template <class Sink>
+  static constexpr void indent_if_pending(Sink &out, bool &pending)
   {
     if constexpr (kIndented) {
       if (pending) {
@@ -299,7 +300,8 @@ struct Renderer {
     }
   }
 
-  static constexpr void text(Out &out, bool &pending, const std::string_view all)
+  template <class Sink>
+  static constexpr void text(Sink &out, bool &pending, const std::string_view all)
   {
     if constexpr (!kIndented) {
       out.raw(all);
@@ -317,8 +319,8 @@ struct Renderer {
     }
   }
 
-  template <Tag tag>
-  static constexpr void value(Out &out, bool &pending, const std::string_view s)
+  template <Tag tag, class Sink>
+  static constexpr void value(Sink &out, bool &pending, const std::string_view s)
   {
     if (s.empty()) return;
     indent_if_pending(out, pending);
@@ -327,8 +329,8 @@ struct Renderer {
   }
 
   template <fixed_string Source, class InnerArgs, uint32_t IndentLength, uint32_t IndentAt, uint32_t From, uint32_t Stop,
-            class... Ctx>
-  static constexpr void run_nested(Out &out, bool &pending, const Ctx &...ctx)
+            class Sink, class... Ctx>
+  static constexpr void run_nested(Sink &out, bool &pending, const Ctx &...ctx)
   {
     if constexpr (IndentLength == 0) {
       indent_if_pending(out, pending);
@@ -342,8 +344,8 @@ struct Renderer {
     }
   }
 
-  template <uint32_t pc, uint32_t stop, class... Ctx>
-  static constexpr void run(Out &out, bool &pending, const Ctx &...ctx)
+  template <uint32_t pc, uint32_t stop, class Sink, class... Ctx>
+  static constexpr void run(Sink &out, bool &pending, const Ctx &...ctx)
   {
     if constexpr (pc < stop) {
       constexpr Op op = P.ops.at(pc);
@@ -426,9 +428,9 @@ struct Renderer {
   }
 };
 
-template <fixed_string Src, class... Partials, class T>
+template <fixed_string Src, class... Partials, class Sink, class T>
 constexpr void
-render(Out &out, const T &data)
+render(Sink &out, const T &data)
 {
   bool pending = false;
   Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(out, pending,

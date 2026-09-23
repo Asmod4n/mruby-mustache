@@ -2,6 +2,7 @@
 #include <mustache/out.hpp>
 
 #include <span>
+#include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -43,6 +44,32 @@ escaped_through_out_over(mrb_state *mrb, mrb_value)
   return mrb_str_new(mrb, buffer.data(), (mrb_int)(out.w - buffer.data()));
 }
 
+// Escapes a value and then writes it raw through a Spread over count
+// buffers of the given size, and gives back what the buffers hold, or
+// nil when the Spread said it is full. The buffers lie one after the
+// other in one heap block, as they do in one mapping, and the block has
+// exactly kEscapeSlack bytes after the last of them: the one reserve a
+// caller of Spread owes. The ASan build sees any write past it.
+mrb_value
+escaped_and_raw_through_spread(mrb_state *mrb, mrb_value)
+{
+  const char *s;
+  mrb_int len;
+  mrb_int size;
+  mrb_int count;
+  mrb_get_args(mrb, "sii", &s, &len, &size, &count);
+  std::vector<char> block((size_t)(size * count) + mustache::kEscapeSlack);
+  std::vector<std::span<char>> buffers;
+  for (mrb_int at = 0; at < count; at++) buffers.emplace_back(block.data() + at * size, (size_t)size);
+  mustache::Spread spread{buffers};
+  spread.escaped(std::string_view(s, (size_t)len));
+  spread.raw(std::string_view(s, (size_t)len));
+  if (spread.full) return mrb_nil_value();
+  std::string got;
+  for (size_t at = 0; at < spread.filled_count(); at++) got += spread.filled(at);
+  return mrb_str_new(mrb, got.data(), (mrb_int)got.size());
+}
+
 }
 
 extern "C" void
@@ -51,4 +78,6 @@ mrb_mruby_mustache_gem_test(mrb_state *mrb)
   struct RClass *t = mrb_define_module(mrb, "MustacheTest");
   mrb_define_module_function(mrb, t, "compiled_texts_size", compiled_texts_size, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, t, "escaped_through_out_over", escaped_through_out_over, MRB_ARGS_REQ(2));
+  mrb_define_module_function(mrb, t, "escaped_and_raw_through_spread", escaped_and_raw_through_spread,
+                             MRB_ARGS_REQ(3));
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -157,5 +158,73 @@ runs_over(const std::span<std::string_view> parts, const std::span<char> buffer)
   if (buffer.size() <= kEscapeSlack) return Runs<kReferAbove>{parts, buffer.first(0)};
   return Runs<kReferAbove>{parts, buffer.first(buffer.size() - kEscapeSlack)};
 }
+
+struct Spread {
+  std::span<const std::span<char>> buffers;
+  size_t                           at = 0;
+  size_t                           written = 0;
+  bool                             full = false;
+
+  constexpr size_t room() const { return at < buffers.size() ? buffers[at].size() - written : 0; }
+
+  constexpr void advance_if_filled()
+  {
+    if (at < buffers.size() && written == buffers[at].size()) {
+      at++;
+      written = 0;
+    }
+  }
+
+  constexpr void raw(std::string_view s)
+  {
+    while (!s.empty()) {
+      advance_if_filled();
+      if (at == buffers.size()) [[unlikely]] {
+        full = true;
+        return;
+      }
+      const size_t take = std::min(s.size(), room());
+      std::copy_n(s.begin(), take, buffers[at].data() + written);
+      written += take;
+      s.remove_prefix(take);
+    }
+    advance_if_filled();
+  }
+
+  constexpr void escaped(std::string_view s)
+  {
+    while (!s.empty()) {
+      advance_if_filled();
+      if (at == buffers.size()) [[unlikely]] {
+        full = true;
+        return;
+      }
+      const size_t fitting = std::min(s.size(), room() / kEntityMax);
+      if (fitting > 0) {
+        char *const from = buffers[at].data() + written;
+        written += (size_t)std::distance(from, escaped_into(from, s.substr(0, fitting)));
+        s.remove_prefix(fitting);
+        continue;
+      }
+      std::array<char, 8> entity{};
+      char *const end = entity_into(entity.data(), kEntities.word.at((unsigned char)s.front()));
+      raw(std::string_view(entity.data(), (size_t)(end - entity.data())));
+      s.remove_prefix(1);
+    }
+    advance_if_filled();
+  }
+
+  constexpr size_t filled_count() const
+  {
+    const size_t whole = std::min(at, buffers.size());
+    return whole + (at < buffers.size() && written > 0 ? 1 : 0);
+  }
+
+  constexpr std::string_view filled(const size_t which) const
+  {
+    const std::span<char> buffer = buffers[which];
+    return std::string_view(buffer.data(), which < at ? buffer.size() : written);
+  }
+};
 
 }

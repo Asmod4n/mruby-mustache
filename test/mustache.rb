@@ -252,6 +252,24 @@ assert('an Out made over a buffer never writes past it') do
   end
 end
 
+# A Spread writes into buffers its caller gives, one after the other,
+# and a value that does not fit in one goes on in the next. The escaper
+# may write kEscapeSlack bytes past the end of a buffer. The caller owes
+# them: the next buffer, when the buffers lie one after the other in one
+# mapping and the Spread writes it next anyway, and one reserve after the
+# last. An entity that does not fit in what is left of a buffer is split
+# between two.
+assert('a Spread goes on in the next buffer and says when all are full') do
+  ['a<b', ('a' * 31) + '<', '<' * 40, ('x' * 100) + '&', 'plain'].each do |v|
+    want = v.gsub('&', '&amp;').gsub('<', '&lt;') + v
+    (1..40).each do |size|
+      count = (want.bytesize + size - 1) / size
+      assert_equal want, MustacheTest.escaped_and_raw_through_spread(v, size, count)
+      assert_nil MustacheTest.escaped_and_raw_through_spread(v, size, count - 1) if count > 1
+    end
+  end
+end
+
 # The context stack holds MAX_DEPTH frames, the data the render starts
 # with being the first, and partials, parents and blocks nest at most
 # MAX_PARTIAL_DEPTH deep. Past that the render stops with RenderError:
