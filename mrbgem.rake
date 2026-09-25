@@ -4,6 +4,9 @@ MRuby::Gem::Specification.new('mruby-mustache') do |spec|
   spec.summary = 'Mustache templates for mruby'
   spec.add_dependency 'mruby-c-ext-helpers', github: 'Asmod4n/mruby-c-ext-helpers'
   spec.cxx.include_paths << "#{spec.dir}/include"
+  # A dependent that renders templates itself needs this face too, not
+  # only the mruby binding.
+  spec.export_include_paths << "#{spec.dir}/include"
   # A build that already asks for C++20 or later keeps its -std: the
   # last -std on the line wins, and a later one here would take away
   # what the build chose, -freflection's C++26 among it.
