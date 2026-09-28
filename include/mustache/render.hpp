@@ -43,12 +43,13 @@ MUSTACHE_TAG(size_of)
 MUSTACHE_TAG(element)
 MUSTACHE_TAG(partial)
 MUSTACHE_TAG(fail)
+MUSTACHE_TAG(write)
 
 #undef MUSTACHE_TAG
 
 enum class Kind : uint8_t { falsy, text, list, map, truthy };
 
-enum class Fault : uint8_t { none, over_capacity, over_limit, not_text, too_deep, over_work, parse, no_memory };
+enum class Fault : uint8_t { none, over_limit, not_text, too_deep, over_work, parse, no_memory };
 
 template <class Key>
 struct Program {
@@ -111,14 +112,12 @@ program_of(Host &host, const std::string_view source, const size_t source_max)
 inline constexpr int kMaxDepth = 32;
 inline constexpr int kMaxPartialDepth = 64;
 inline constexpr size_t kMaxRenderScore = size_t{1} << 24;
+inline constexpr size_t kChunk = 4096;
 
-template <class Host, class Value, class Key, class Sink = Out, int kDepthMax = kMaxDepth,
-          int kPartialDepthMax = kMaxPartialDepth>
+template <class Host, class Value, class Key, int kDepthMax = kMaxDepth, int kPartialDepthMax = kMaxPartialDepth>
 class Walk {
 public:
-  Walk(Host &host, Sink &out, const size_t score_max = kMaxRenderScore) : host_(host), out_(out), score_max_(score_max)
-  {
-  }
+  Walk(Host &host, const size_t score_max = kMaxRenderScore) : host_(host), score_max_(score_max) {}
 
   Fault run(const Program<Key> &p, const Value &root)
   {
@@ -126,12 +125,10 @@ public:
     depth_ = 1;
     score_ = 0;
     fault_ = Fault::none;
+    w_ = buffer_.data();
     run(p, 0, (uint32_t)p.ops.size(), 0, nullptr, nullptr);
-    if (fault_ == Fault::none && out_.full) [[unlikely]] fault_ = Fault::over_capacity;
+    if (fault_ == Fault::none) [[likely]] written(true);
     switch (fault_) {
-      case Fault::over_capacity:
-        fail(host_, fault_, std::string_view("the answer is larger than the buffer"), size_t{0}, size_t{0});
-        break;
       case Fault::not_text:
         fail(host_, fault_, std::string_view("a value is not text"), size_t{0}, size_t{0});
         break;
@@ -161,18 +158,59 @@ private:
   };
 
   Host &host_;
-  Sink &out_;
   std::array<Value, kDepthMax> stack_{};
   int   depth_ = 0;
   size_t score_ = 0;
   size_t score_max_;
   Fault fault_ = Fault::none;
+  char *w_ = nullptr;
+  std::array<char, kChunk + kEscapeSlack> buffer_;
+
+  size_t room() const { return kChunk - std::min((size_t)(w_ - buffer_.data()), kChunk); }
+
+  bool written(const bool last)
+  {
+    const Fault f = write(host_, std::string_view(buffer_.data(), (size_t)(w_ - buffer_.data())), last);
+    w_ = buffer_.data();
+    if (f != Fault::none) [[unlikely]] {
+      fault_ = f;
+      return false;
+    }
+    return true;
+  }
+
+  void raw(const std::string_view s)
+  {
+    if (s.size() > room()) [[unlikely]] {
+      if (!written(false)) return;
+      if (s.size() > kChunk) {
+        const Fault f = write(host_, s, false);
+        if (f != Fault::none) [[unlikely]] fault_ = f;
+        return;
+      }
+    }
+    w_ = std::copy_n(s.begin(), s.size(), w_);
+  }
+
+  void escaped(const std::string_view s)
+  {
+    std::string_view rest = s;
+    while (!rest.empty()) {
+      const size_t take = std::min(rest.size(), room() / kEntityMax);
+      if (take == 0) [[unlikely]] {
+        if (!written(false)) return;
+        continue;
+      }
+      w_ = escaped_into(w_, rest.substr(0, take));
+      rest.remove_prefix(take);
+    }
+  }
 
   void indent_of(const Indent *const ind)
   {
     if (ind == nullptr) return;
     indent_of(ind->outer);
-    out_.raw(ind->text);
+    raw(ind->text);
   }
 
   void indent_if_pending(Indent *const ind)
@@ -185,7 +223,7 @@ private:
   void text(const std::string_view all, Indent *const ind)
   {
     if (ind == nullptr) [[likely]] {
-      out_.raw(all);
+      raw(all);
       return;
     }
     std::string_view s = all;
@@ -193,7 +231,7 @@ private:
       const size_t nl = s.find('\n');
       const size_t line = nl == std::string_view::npos ? s.size() : nl + 1;
       indent_if_pending(ind);
-      out_.raw(s.substr(0, line));
+      raw(s.substr(0, line));
       if (nl != std::string_view::npos) ind->pending = true;
       s.remove_prefix(line);
     }
@@ -273,7 +311,7 @@ private:
     score_ += work;
     uint32_t pc = from;
     while (pc < stop) {
-      if (out_.full) [[unlikely]] return false;
+      if (fault_ != Fault::none) [[unlikely]] return false;
       const Op &op = p.ops.at(pc);
       switch (op.tag) {
         case Tag::text:
@@ -294,8 +332,8 @@ private:
           const std::string_view s = text_of(host_, *v);
           if (s.empty()) break;
           indent_if_pending(ind);
-          if (op.tag == Tag::var) out_.escaped(s);
-          else out_.raw(s);
+          if (op.tag == Tag::var) escaped(s);
+          else raw(s);
           break;
         }
         case Tag::section: {
