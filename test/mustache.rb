@@ -1514,3 +1514,16 @@ assert('max_render_score: each level can only lower the one around it') do
   assert_raise(Mustache::RenderError) { sub.new('x{{y}}').render({}) }
   assert_equal 'x', Mustache::Template.new('x{{y}}').render({})
 end
+
+# mruby removes a dynamic symbol that no Ruby object holds once 4096
+# of them exist. A key that the template text brings in, and that no
+# literal names, is such a symbol. The template has to keep it, or a
+# later render with the same name finds nothing and writes an empty
+# string without an error.
+assert('a template keeps its key symbols through the symbol GC') do
+  t = Mustache::Template.new('{{' + 'zqkeyone' + '}}')
+  assert_equal 'x', t.render({ 'zqkeyone'.to_sym => 'x' })
+  5000.times { |i| ('zqfill' + i.to_s).to_sym }
+  assert_equal 'x', t.render({ 'zqkeyone'.to_sym => 'x' })
+end
+

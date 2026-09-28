@@ -15,6 +15,9 @@
 #include <mruby/hash.h>
 #include <mruby/numeric.h>
 #include <mruby/presym.h>
+#ifndef MRB_PRESYM_SCANNING
+#include <mruby/presym/table.h>
+#endif
 #include <mruby/string.h>
 #include <mruby/variable.h>
 
@@ -47,6 +50,7 @@
 struct MrubyHost {
   mrb_state *mrb;
   mrb_value  partials;
+  mrb_value  symbol_keys;
 };
 
 struct Template {
@@ -73,7 +77,10 @@ namespace mustache {
 inline mrb_sym
 tag_invoke(key_of_tag, MrubyHost &h, const std::string_view name)
 {
-  return mrb_intern(h.mrb, name.data(), name.size());
+  const mrb_sym key = mrb_intern(h.mrb, name.data(), name.size());
+  if (key > MRB_PRESYM_MAX && mrb_array_p(h.symbol_keys)) [[unlikely]]
+    mrb_ary_push(h.mrb, h.symbol_keys, mrb_symbol_value(key));
+  return key;
 }
 
 inline std::optional<mrb_value>
@@ -290,7 +297,7 @@ limit_lowered(mrb_state *mrb, const mrb_value holder, const mrb_sym name, const 
 {
   const mrb_value arg = mrb_get_arg1(mrb);
   const size_t lowered = size_of_argument(mrb, arg);
-  MrubyHost host{mrb, mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value()};
   mustache::within_limit(host, mrb_sym_name(mrb, name), lowered, above);
   mrb_iv_set(mrb, holder, name, mrb_value_from_size_t(mrb, lowered));
   return arg;
@@ -301,7 +308,7 @@ instance_limit(mrb_state *mrb, const mrb_value arg, const mrb_sym name, const si
 {
   if (mrb_nil_p(arg)) return above;
   const size_t lowered = size_of_argument(mrb, arg);
-  MrubyHost host{mrb, mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value()};
   mustache::within_limit(host, mrb_sym_name(mrb, name), lowered, above);
   return lowered;
 }
@@ -373,13 +380,14 @@ template_initialize(mrb_state *mrb, mrb_value self)
       instance_limit(mrb, source_max_arg, MRB_SYM(max_source_bytes), class_limit(mrb, klass, MRB_SYM(max_source_bytes), kSourceCeiling));
   const size_t score_max = instance_limit(mrb, score_max_arg, MRB_SYM(max_render_score),
                                           class_limit(mrb, klass, MRB_SYM(max_render_score), MUSTACHE_MAX_RENDER_SCORE));
-  MrubyHost host{mrb, mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_ary_new(mrb)};
   std::optional<mustache::Program<mrb_sym>> program =
       mustache::program_of<mrb_sym>(host, std::string_view(src, (size_t)src_len), source_max);
   if (!program) [[unlikely]] return self;
   if (DATA_PTR(self) != nullptr) mrb_cpp_delete(mrb, static_cast<Template *>(DATA_PTR(self)));
   DATA_PTR(self) = nullptr;
   mrb_cpp_new<Template>(mrb, self, std::move(*program), mustache::SizeHint{}, bytes, score_max);
+  mrb_iv_set(mrb, self, MRB_SYM(symbol_keys), host.symbol_keys);
   return self;
 }
 
@@ -400,7 +408,7 @@ template_render(mrb_state *mrb, mrb_value self)
   }
   Template *const t = mrb_cpp_get<Template>(mrb, self);
   if (t == nullptr) mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
-  MrubyHost host{mrb, partials};
+  MrubyHost host{mrb, partials, mrb_nil_value()};
   Answer answer{mrb, mrb_str_new_capa(mrb, (mrb_int)std::min(t->hint.get(), t->answer_max + mustache::kEscapeSlack)),
                 t->answer_max};
   mustache::Walk<MrubyHost, mrb_value, mrb_sym, Answer, MUSTACHE_MAX_DEPTH, MUSTACHE_MAX_PARTIAL_DEPTH> walk(host, answer,
