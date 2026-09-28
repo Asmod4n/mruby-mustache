@@ -42,22 +42,12 @@ LLVMFuzzerTestOneInput(const uint8_t *const data, const size_t size)
   const Value root{m};
   const Value *const rp = &root;
 
-  std::vector<char> buffer(300);
-  Out out = out_over(buffer);
-  Walk<Host, const Value *, Key, Out, 8, 8> walk(host, out);
+  Walk<Host, const Value *, Key, 8, 8> walk(host);
   walk.run(*program, rp);
 
-  std::vector<std::string_view> parts(64);
-  std::vector<char> runs_buffer(200);
-  Runs<16> runs = runs_over<16>(parts, runs_buffer);
-  Walk<Host, const Value *, Key, Runs<16>, 8, 8> runs_walk(host, runs);
-  runs_walk.run(*program, rp);
-  (void)runs.closed();
-
   for (const size_t score : {size_t{1}, size_t{7}, size_t{64}, size_t{1} << 12}) {
-    std::vector<char> small(256);
-    Out small_out = out_over(small);
-    Walk<Host, const Value *, Key, Out, 6, 6> scored(host, small_out, score);
+    host.answer.clear();
+    Walk<Host, const Value *, Key, 6, 6> scored(host, score);
     scored.run(*program, rp);
   }
   return 0;

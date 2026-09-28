@@ -8,41 +8,27 @@ assert('a render that raises leaves the template whole') do
   assert_equal 'xy', t.render({ rows: [{ a: 'x' }, { a: 'y' }] })
 end
 
-# The second argument is the largest answer a render may give, not a
-# buffer: a template holds its program and a size hint, and a render
-# makes one String of the size the hint expects. So a large limit costs
-# nothing until an answer is that large.
-assert('an answer limit allocates nothing') do
-  t = Mustache::Template.new('x{{v}}', 2**60)
-  assert_equal 'xy', t.render({ v: 'y' })
-end
-
-# An escaped value is written into the room above the answer, less the 32
-# bytes the wide escape may store past its end. A raw value that does not
-# fit grows the answer to twice its size, or to exactly what it needs when
-# that is more; a fresh template starts at 75 bytes, so a raw value over
-# 150 bytes leaves the answer full to its last byte. The room above it is
-# then none rather than a negative number, and the escape after it has to
-# grow the answer, not write past it.
-assert('an escaped value right after a raw write that filled the answer') do
-  (151..200).each do |n|
-    t = Mustache::Template.new('{{{a}}}{{b}}')
-    assert_equal ('x' * n) + '&lt;&amp;' * 50, t.render({ a: 'x' * n, b: '<&' * 50 })
+# A render fills a buffer of 4096 bytes and hands each full buffer to the
+# host. A value that does not fit starts the next buffer, an escaped value
+# is split between two buffers, and a raw value longer than one buffer is
+# handed over as it is. Every length around 4096 has to come back whole.
+assert('an answer that crosses a buffer boundary comes back whole') do
+  t = Mustache::Template.new('{{{a}}}{{b}}{{{c}}}')
+  [4000, 4090, 4095, 4096, 4097, 8191, 8192, 8193, 20_000].each do |n|
+    a = 'x' * n
+    b = '<&' * 3000
+    c = 'y' * n
+    assert_equal a + '&lt;&amp;' * 3000 + c, t.render({ a: a, b: b, c: c })
   end
 end
 
-# The answer starts at the size the hint learned from the renders before
-# it and grows when a render outgrows it, raw text through mrb_str_cat
-# and an escaped value through a resize that leaves room for the wide
-# escape. What comes back is the same, whatever the hint said.
-assert('an answer larger than the hint grows and stays right') do
-  t = Mustache::Template.new('{{a}}{{{b}}}{{c}}')
-  assert_equal 'x', t.render({ a: 'x' })
-  big = '<&>' * 5000
-  raw = 'r' * 10_000
-  assert_equal '&lt;&amp;&gt;' * 5000 + raw + 'z', t.render({ a: big, b: raw, c: 'z' })
-  assert_equal 'x', t.render({ a: 'x' })
-  assert_equal raw, t.render({ b: raw })
+# An escaped value grows up to six times. The part of it that fits in the
+# rest of a buffer is escaped there, and the rest goes to the next buffer.
+assert('an escaped value is split at a buffer boundary without a loss') do
+  t = Mustache::Template.new('{{{a}}}{{b}}')
+  (4080..4100).each do |n|
+    assert_equal ('x' * n) + '&quot;' * 700, t.render({ a: 'x' * n, b: '"' * 700 })
+  end
 end
 
 assert('a size cannot be negative') do
@@ -304,17 +290,6 @@ assert('a template with 2000 tags compiles and renders') do
   data = {}
   2000.times { |i| data[:"v#{i}"] = 'x' }
   assert_equal 'x' * 2000, Mustache::Template.new(src).render(data)
-end
-
-# The answer is written into one buffer of the size the template was
-# given, and never past it.
-assert('an answer larger than the buffer is a RenderError') do
-  t = Mustache::Template.new('{{v}}', 4)
-  assert_equal 'abcd', t.render({ v: 'abcd' })
-  assert_raise(Mustache::RenderError) { t.render({ v: 'abcde' }) }
-  assert_raise(Mustache::RenderError) { t.render({ v: '"' }) }
-  assert_equal '&lt;', t.render({ v: '<' })
-  assert_equal 'ab', t.render({ v: 'ab' })
 end
 
 assert('partials: found, missing, not a Template') do
@@ -1437,8 +1412,8 @@ end
 # rows over a one-op body costs 3 for the outer run and 2 per row.
 assert('the render score counts every run of a body') do
   data = { l: %w[a b c d e f g h i j] }
-  assert_equal 'x' * 10, Mustache::Template.new('{{#l}}x{{/l}}', nil, nil, 23).render(data)
-  e = assert_raise(Mustache::RenderError) { Mustache::Template.new('{{#l}}x{{/l}}', nil, nil, 22).render(data) }
+  assert_equal 'x' * 10, Mustache::Template.new('{{#l}}x{{/l}}', nil, 23).render(data)
+  e = assert_raise(Mustache::RenderError) { Mustache::Template.new('{{#l}}x{{/l}}', nil, 22).render(data) }
   assert_equal 'the render does more work than max_render_score', e.message
 end
 
@@ -1451,17 +1426,9 @@ assert('partials that fan out stop at the render score') do
   partials = {}
   (1..levels).each { |i| partials[:"p#{i}"] = Mustache::Template.new("{{>p#{i + 1}}}" * 8) }
   partials[:"p#{levels + 1}"] = Mustache::Template.new('')
-  top = Mustache::Template.new('{{>p1}}', nil, nil, [Mustache.max_render_score, 2**24].min)
+  top = Mustache::Template.new('{{>p1}}', nil, [Mustache.max_render_score, 2**24].min)
   e = assert_raise(Mustache::RenderError) { top.render({}, partials) }
   assert_equal 'the render does more work than max_render_score', e.message
-end
-
-# The answer limit may not exceed what one mruby String can hold, less the
-# slack the escaper writes past the end.
-assert('the answer limit stays below the longest mruby String') do
-  most = 0x7fffffffffffffff
-  assert_raise(ArgumentError) { Mustache::Template.new('x', most) } if most.is_a?(Integer)
-  assert_raise(ArgumentError) { Mustache::Template.new('x', -1) }
 end
 
 # This test lowers the limit of the VM, and nothing can raise it again, so
@@ -1485,13 +1452,13 @@ assert('max_source_bytes: each level can only lower the one around it') do
     sub.max_source_bytes = 16
     assert_equal 16, sub.max_source_bytes
     assert_equal 64, Mustache::Template.max_source_bytes
-    assert_raise(ArgumentError) { sub.new('x', 16, 17) }
-    assert_equal 'x', sub.new('x', 16, 8).render({})
+    assert_raise(ArgumentError) { sub.new('x', 17) }
+    assert_equal 'x', sub.new('x', 8).render({})
     e = assert_raise(ArgumentError) { sub.new('x' * 17) }
     assert_equal 'template too long (len=17 max=16)', e.message
     assert_equal 'x' * 17, Mustache::Template.new('x' * 17).render({})
     assert_raise(ArgumentError) { Mustache::Template.new('x' * 65) }
-    assert_raise(ArgumentError) { Mustache::Template.new('x' * 9, 64, 8) }
+    assert_raise(ArgumentError) { Mustache::Template.new('x' * 9, 8) }
   end
 end
 
@@ -1509,7 +1476,7 @@ assert('max_render_score: each level can only lower the one around it') do
   assert_equal 'max_render_score too long (len=65 max=64)', e.message
   sub.max_render_score = 2
   assert_equal 2, sub.max_render_score
-  assert_raise(ArgumentError) { sub.new('x', nil, nil, 3) }
+  assert_raise(ArgumentError) { sub.new('x', nil, 3) }
   assert_equal 'x', sub.new('x').render({})
   assert_raise(Mustache::RenderError) { sub.new('x{{y}}').render({}) }
   assert_equal 'x', Mustache::Template.new('x{{y}}').render({})

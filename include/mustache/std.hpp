@@ -100,7 +100,15 @@ struct Host {
   std::string_view what;
   size_t           asked = 0;
   size_t           allowed = 0;
+  std::string      answer;
 };
+
+inline Fault
+tag_invoke(write_tag, Host &h, const std::string_view bytes, const bool)
+{
+  h.answer.append(bytes);
+  return Fault::none;
+}
 
 inline Key
 tag_invoke(key_of_tag, Host &, const std::string_view name)

@@ -51,12 +51,11 @@ struct MrubyHost {
   mrb_state *mrb;
   mrb_value  partials;
   mrb_value  symbol_keys;
+  mrb_value  answer;
 };
 
 struct Template {
   mustache::Program<mrb_sym> program;
-  mustache::SizeHint         hint;
-  size_t                     answer_max;
   size_t                     score_max;
 };
 
@@ -81,6 +80,13 @@ tag_invoke(key_of_tag, MrubyHost &h, const std::string_view name)
   if (key > MRB_PRESYM_MAX && mrb_array_p(h.symbol_keys)) [[unlikely]]
     mrb_ary_push(h.mrb, h.symbol_keys, mrb_symbol_value(key));
   return key;
+}
+
+inline Fault
+tag_invoke(write_tag, MrubyHost &h, const std::string_view bytes, const bool)
+{
+  mrb_str_cat(h.mrb, h.answer, bytes.data(), bytes.size());
+  return Fault::none;
 }
 
 inline std::optional<mrb_value>
@@ -156,7 +162,6 @@ tag_invoke(fail_tag, MrubyHost &h, const Fault fault, const std::string_view wha
     case Fault::not_text:
       mrb_exc_raise(mrb, mrb_exc_new(mrb, E_TYPE_ERROR, what.data(), (mrb_int)what.size()));
       break;
-    case Fault::over_capacity:
     case Fault::too_deep:
     case Fault::over_work:
       mrb_exc_raise(mrb, mrb_exc_new(mrb, error_class(mrb, MRB_SYM(RenderError)), what.data(), (mrb_int)what.size()));
@@ -168,93 +173,12 @@ tag_invoke(fail_tag, MrubyHost &h, const Fault fault, const std::string_view wha
 
 namespace {
 
-inline constexpr size_t kEscapeCountedPiece = 32;
-
 #if defined(MRB_STR_LENGTH_MAX) && MRB_STR_LENGTH_MAX != 0
 inline constexpr size_t kStringMax = (size_t)MRB_STR_LENGTH_MAX - 1;
 #else
 inline constexpr size_t kStringMax = std::min<size_t>(MRB_FIXNUM_MAX, MRB_SSIZE_MAX) - 1;
 #endif
 inline constexpr size_t kSourceCeiling = std::min(mustache::kSourceMax, kStringMax);
-inline constexpr size_t kAnswerCeiling = kStringMax - mustache::kEscapeSlack;
-
-struct Answer {
-  mrb_state *mrb;
-  mrb_value  string;
-  size_t     max;
-  char      *begin = RSTRING_PTR(string);
-  char      *w = begin;
-  char      *end = begin + RSTRING_CAPA(string);
-  size_t     peak = 0;
-  bool       full = false;
-
-  size_t length() const { return (size_t)(w - begin); }
-
-  void grow(const size_t more)
-  {
-    const size_t length_now = length();
-    RSTR_SET_LEN(RSTRING(string), (mrb_int)length_now);
-    const size_t doubled = std::min(2 * (size_t)(end - begin), max + mustache::kEscapeSlack);
-    mrb_str_resize(mrb, string, (mrb_int)std::max(doubled, length_now + more));
-    RSTR_SET_LEN(RSTRING(string), (mrb_int)length_now);
-    begin = RSTRING_PTR(string);
-    w = begin + length_now;
-    end = begin + RSTRING_CAPA(string);
-  }
-
-  void raw(const std::string_view s)
-  {
-    if (max - length() < s.size()) [[unlikely]] {
-      full = true;
-      return;
-    }
-    if ((size_t)(end - w) < s.size()) [[unlikely]] grow(s.size());
-    w = std::copy_n(s.begin(), s.size(), w);
-  }
-
-  size_t escape_headroom() const
-  {
-    return w + mustache::kEscapeSlack < end ? (size_t)(end - w) - mustache::kEscapeSlack : 0;
-  }
-
-  void escaped(const std::string_view s)
-  {
-    if (!mustache::escaped_fits(s, max - length())) [[unlikely]] {
-      full = true;
-      return;
-    }
-    std::string_view rest = s;
-    while (!rest.empty()) {
-      const size_t take = std::min(rest.size(), escape_headroom() / mustache::kEntityMax);
-      if (take > 0) [[likely]] {
-        w = mustache::escaped_into(w, rest.substr(0, take));
-        rest.remove_prefix(take);
-        continue;
-      }
-      const std::string_view piece = rest.substr(0, kEscapeCountedPiece);
-      if (mustache::escaped_size_of(piece) > escape_headroom()) {
-        grow(rest.size() + mustache::kEscapeSlack);
-        continue;
-      }
-      w = mustache::escaped_into(w, piece);
-      rest.remove_prefix(piece.size());
-    }
-    peak = std::max(peak, length() + mustache::kEscapeSlack);
-  }
-
-  mrb_value finished()
-  {
-    const size_t length_now = length();
-    peak = std::max(peak, length_now);
-    if ((size_t)(end - w) > std::max(length_now, size_t{256})) [[unlikely]] {
-      RSTR_SET_LEN(RSTRING(string), RSTRING_CAPA(string));
-      mrb_str_resize(mrb, string, (mrb_int)length_now);
-    }
-    RSTR_SET_LEN(RSTRING(string), (mrb_int)length_now);
-    RSTRING_PTR(string)[length_now] = '\0';
-    return string;
-  }
-};
 
 size_t
 size_of_argument(mrb_state *mrb, const mrb_value v)
@@ -297,7 +221,7 @@ limit_lowered(mrb_state *mrb, const mrb_value holder, const mrb_sym name, const 
 {
   const mrb_value arg = mrb_get_arg1(mrb);
   const size_t lowered = size_of_argument(mrb, arg);
-  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value(), mrb_nil_value()};
   mustache::within_limit(host, mrb_sym_name(mrb, name), lowered, above);
   mrb_iv_set(mrb, holder, name, mrb_value_from_size_t(mrb, lowered));
   return arg;
@@ -308,7 +232,7 @@ instance_limit(mrb_state *mrb, const mrb_value arg, const mrb_sym name, const si
 {
   if (mrb_nil_p(arg)) return above;
   const size_t lowered = size_of_argument(mrb, arg);
-  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value(), mrb_nil_value()};
   mustache::within_limit(host, mrb_sym_name(mrb, name), lowered, above);
   return lowered;
 }
@@ -370,23 +294,21 @@ template_initialize(mrb_state *mrb, mrb_value self)
 {
   const char *src;
   mrb_int src_len;
-  mrb_value bytes_arg = mrb_nil_value();
   mrb_value source_max_arg = mrb_nil_value();
   mrb_value score_max_arg = mrb_nil_value();
-  mrb_get_args(mrb, "s|ooo", &src, &src_len, &bytes_arg, &source_max_arg, &score_max_arg);
+  mrb_get_args(mrb, "s|oo", &src, &src_len, &source_max_arg, &score_max_arg);
   struct RClass *const klass = mrb_obj_class(mrb, self);
-  const size_t bytes = instance_limit(mrb, bytes_arg, MRB_SYM(bytes), kAnswerCeiling);
   const size_t source_max =
       instance_limit(mrb, source_max_arg, MRB_SYM(max_source_bytes), class_limit(mrb, klass, MRB_SYM(max_source_bytes), kSourceCeiling));
   const size_t score_max = instance_limit(mrb, score_max_arg, MRB_SYM(max_render_score),
                                           class_limit(mrb, klass, MRB_SYM(max_render_score), MUSTACHE_MAX_RENDER_SCORE));
-  MrubyHost host{mrb, mrb_nil_value(), mrb_ary_new(mrb)};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_ary_new(mrb), mrb_nil_value()};
   std::optional<mustache::Program<mrb_sym>> program =
       mustache::program_of<mrb_sym>(host, std::string_view(src, (size_t)src_len), source_max);
   if (!program) [[unlikely]] return self;
   if (DATA_PTR(self) != nullptr) mrb_cpp_delete(mrb, static_cast<Template *>(DATA_PTR(self)));
   DATA_PTR(self) = nullptr;
-  mrb_cpp_new<Template>(mrb, self, std::move(*program), mustache::SizeHint{}, bytes, score_max);
+  mrb_cpp_new<Template>(mrb, self, std::move(*program), score_max);
   mrb_iv_set(mrb, self, MRB_SYM(symbol_keys), host.symbol_keys);
   return self;
 }
@@ -408,15 +330,10 @@ template_render(mrb_state *mrb, mrb_value self)
   }
   Template *const t = mrb_cpp_get<Template>(mrb, self);
   if (t == nullptr) mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
-  MrubyHost host{mrb, partials, mrb_nil_value()};
-  Answer answer{mrb, mrb_str_new_capa(mrb, (mrb_int)std::min(t->hint.get(), t->answer_max + mustache::kEscapeSlack)),
-                t->answer_max};
-  mustache::Walk<MrubyHost, mrb_value, mrb_sym, Answer, MUSTACHE_MAX_DEPTH, MUSTACHE_MAX_PARTIAL_DEPTH> walk(host, answer,
-                                                                                                  t->score_max);
+  MrubyHost host{mrb, partials, mrb_nil_value(), mrb_str_new(mrb, nullptr, 0)};
+  mustache::Walk<MrubyHost, mrb_value, mrb_sym, MUSTACHE_MAX_DEPTH, MUSTACHE_MAX_PARTIAL_DEPTH> walk(host, t->score_max);
   walk.run(t->program, ctx);
-  const mrb_value finished = answer.finished();
-  t->hint.update(answer.peak);
-  return finished;
+  return host.answer;
 }
 
 } // namespace
@@ -440,8 +357,8 @@ mrb_mruby_mustache_gem_init(mrb_state *mrb)
   mrb_define_class_method_id(mrb, tmpl, MRB_SYM_E(max_source_bytes), template_class_lower_source_max, MRB_ARGS_REQ(1));
   mrb_define_class_method_id(mrb, tmpl, MRB_SYM(max_render_score), template_class_score_max, MRB_ARGS_NONE());
   mrb_define_class_method_id(mrb, tmpl, MRB_SYM_E(max_render_score), template_class_lower_score_max, MRB_ARGS_REQ(1));
-  mrb_define_method_id(mrb, tmpl, MRB_SYM(initialize), template_initialize, MRB_ARGS_ARG(1, 3));
-  mrb_define_class_method_id(mrb, tmpl, MRB_SYM(compile), template_compile, MRB_ARGS_ARG(1, 3));
+  mrb_define_method_id(mrb, tmpl, MRB_SYM(initialize), template_initialize, MRB_ARGS_ARG(1, 2));
+  mrb_define_class_method_id(mrb, tmpl, MRB_SYM(compile), template_compile, MRB_ARGS_ARG(1, 2));
   mrb_define_method_id(mrb, tmpl, MRB_SYM(render), template_render, MRB_ARGS_OPT(2));
 }
 
