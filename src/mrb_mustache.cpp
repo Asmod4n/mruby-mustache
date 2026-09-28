@@ -1,6 +1,8 @@
 #include <mustache/render.hpp>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -52,6 +54,7 @@ struct MrubyHost {
   mrb_value  partials;
   mrb_value  symbol_keys;
   mrb_value  answer;
+  std::array<char, 32> text;
 };
 
 struct Template {
@@ -104,6 +107,11 @@ tag_invoke(kind_of_tag, MrubyHost &h, const mrb_value v)
   switch (mrb_type(v)) {
     case MRB_TT_FALSE:  return Kind::falsy;
     case MRB_TT_STRING: return Kind::text;
+    case MRB_TT_INTEGER: return Kind::text;
+#ifndef MRB_NO_FLOAT
+    case MRB_TT_FLOAT:  return Kind::text;
+#endif
+    case MRB_TT_SYMBOL: return Kind::text;
     case MRB_TT_ARRAY:  return Kind::list;
     case MRB_TT_HASH:   return mrb_hash_empty_p(h.mrb, v) ? Kind::falsy : Kind::map;
     default:            return Kind::truthy;
@@ -111,9 +119,29 @@ tag_invoke(kind_of_tag, MrubyHost &h, const mrb_value v)
 }
 
 inline std::string_view
-tag_invoke(text_of_tag, MrubyHost &, const mrb_value v)
+tag_invoke(text_of_tag, MrubyHost &h, const mrb_value v)
 {
-  return {RSTRING_PTR(v), (size_t)RSTRING_LEN(v)};
+  switch (mrb_type(v)) {
+    case MRB_TT_INTEGER: {
+      const auto [end, ec] = std::to_chars(h.text.data(), h.text.data() + h.text.size(), mrb_integer(v));
+      return {h.text.data(), (size_t)(end - h.text.data())};
+    }
+#ifndef MRB_NO_FLOAT
+    case MRB_TT_FLOAT: {
+      const auto [end, ec] = std::to_chars(h.text.data(), h.text.data() + h.text.size(), mrb_float(v));
+      return {h.text.data(), (size_t)(end - h.text.data())};
+    }
+#endif
+    case MRB_TT_SYMBOL: {
+      mrb_int len = 0;
+      const char *const name = mrb_sym_name_len(h.mrb, mrb_symbol(v), &len);
+      if (name == nullptr) [[unlikely]] return {};
+      if ((size_t)len > h.text.size()) return {name, (size_t)len};
+      return {h.text.data(), (size_t)(std::copy_n(name, len, h.text.data()) - h.text.data())};
+    }
+    default:
+      return {RSTRING_PTR(v), (size_t)RSTRING_LEN(v)};
+  }
 }
 
 inline size_t
@@ -221,7 +249,7 @@ limit_lowered(mrb_state *mrb, const mrb_value holder, const mrb_sym name, const 
 {
   const mrb_value arg = mrb_get_arg1(mrb);
   const size_t lowered = size_of_argument(mrb, arg);
-  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value(), mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value(), mrb_nil_value(), {}};
   mustache::within_limit(host, mrb_sym_name(mrb, name), lowered, above);
   mrb_iv_set(mrb, holder, name, mrb_value_from_size_t(mrb, lowered));
   return arg;
@@ -232,7 +260,7 @@ instance_limit(mrb_state *mrb, const mrb_value arg, const mrb_sym name, const si
 {
   if (mrb_nil_p(arg)) return above;
   const size_t lowered = size_of_argument(mrb, arg);
-  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value(), mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_nil_value(), mrb_nil_value(), {}};
   mustache::within_limit(host, mrb_sym_name(mrb, name), lowered, above);
   return lowered;
 }
@@ -302,7 +330,7 @@ template_initialize(mrb_state *mrb, mrb_value self)
       instance_limit(mrb, source_max_arg, MRB_SYM(max_source_bytes), class_limit(mrb, klass, MRB_SYM(max_source_bytes), kSourceCeiling));
   const size_t score_max = instance_limit(mrb, score_max_arg, MRB_SYM(max_render_score),
                                           class_limit(mrb, klass, MRB_SYM(max_render_score), MUSTACHE_MAX_RENDER_SCORE));
-  MrubyHost host{mrb, mrb_nil_value(), mrb_ary_new(mrb), mrb_nil_value()};
+  MrubyHost host{mrb, mrb_nil_value(), mrb_ary_new(mrb), mrb_nil_value(), {}};
   std::optional<mustache::Program<mrb_sym>> program =
       mustache::program_of<mrb_sym>(host, std::string_view(src, (size_t)src_len), source_max);
   if (!program) [[unlikely]] return self;
@@ -330,7 +358,7 @@ template_render(mrb_state *mrb, mrb_value self)
   }
   Template *const t = mrb_cpp_get<Template>(mrb, self);
   if (t == nullptr) mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
-  MrubyHost host{mrb, partials, mrb_nil_value(), mrb_str_new(mrb, nullptr, 0)};
+  MrubyHost host{mrb, partials, mrb_nil_value(), mrb_str_new(mrb, nullptr, 0), {}};
   mustache::Walk<MrubyHost, mrb_value, mrb_sym, MUSTACHE_MAX_DEPTH, MUSTACHE_MAX_PARTIAL_DEPTH> walk(host, t->score_max);
   walk.run(t->program, ctx);
   return host.answer;

@@ -4,7 +4,7 @@
 # a render destroys what the render held, and the template renders again.
 assert('a render that raises leaves the template whole') do
   t = Mustache::Template.new('{{#rows}}{{a}}{{/rows}}')
-  assert_raise(TypeError) { t.render({ rows: [{ a: 'x' }, { a: 1 }] }) }
+  assert_raise(TypeError) { t.render({ rows: [{ a: 'x' }, { a: true }] }) }
   assert_equal 'xy', t.render({ rows: [{ a: 'x' }, { a: 'y' }] })
 end
 
@@ -56,14 +56,45 @@ assert('a key is a Symbol') do
   assert_equal 'Hi ', t.render({ 'name' => 'alice' })
 end
 
-# A value is a String. Nothing is converted, because a conversion is a
-# call into Ruby while the render holds pointers into the data.
-assert('a value that is not a String is a TypeError') do
+# A value is written without a copy into Ruby and without a call into
+# Ruby. A String is written as it is, an Integer and a Float as
+# std::to_chars writes them, and a Symbol as its name.
+assert('String, Integer, Float and Symbol are written as text') do
   t = Mustache::Template.new('{{v}}')
-  assert_raise(TypeError) { t.render({ v: 42 }) }
+  assert_equal 'ab', t.render({ v: 'ab' })
+  assert_equal '42', t.render({ v: 42 })
+  assert_equal '-7', t.render({ v: -7 })
+  assert_equal '0', t.render({ v: 0 })
+  assert_equal '1.5', t.render({ v: 1.5 })
+  assert_equal '1', t.render({ v: 1.0 })
+  assert_equal '1e+20', t.render({ v: 1e20 })
+  assert_equal '-0', t.render({ v: -0.0 })
+  assert_equal 'sym', t.render({ v: :sym })
+  assert_equal 'a_much_longer_symbol_name_than_32_bytes_is_here', t.render({ v: :a_much_longer_symbol_name_than_32_bytes_is_here })
+end
+
+# A Symbol name is escaped like a String. {{{ }}} writes it as it is.
+assert('a Symbol name is escaped') do
+  assert_equal '&lt;a&gt;', Mustache::Template.new('{{v}}').render({ v: :'<a>' })
+  assert_equal '<a>', Mustache::Template.new('{{{v}}}').render({ v: :'<a>' })
+end
+
+# true and false only switch a section on or off. As a value they are
+# no text, so the render refuses them.
+assert('true and a value of any other class is a TypeError') do
+  t = Mustache::Template.new('{{v}}')
   assert_raise(TypeError) { t.render({ v: true }) }
-  assert_raise(TypeError) { t.render({ v: :sym }) }
-  assert_raise(TypeError) { Mustache::Template.new('{{{v}}}').render({ v: 1.5 }) }
+  assert_raise(TypeError) { t.render({ v: Object.new }) }
+  assert_raise(TypeError) { t.render({ v: [1] }) }
+  big = 2**100
+  assert_raise(TypeError) { t.render({ v: big }) } if big.is_a?(Integer)
+end
+
+# A number is a value that is not false, so a section runs once with the
+# number on top of the stack.
+assert('a section over a number writes the number') do
+  assert_equal '5', Mustache::Template.new('{{#n}}{{.}}{{/n}}').render({ n: 5 })
+  assert_equal '', Mustache::Template.new('{{^n}}x{{/n}}').render({ n: 0 })
 end
 
 assert('a missing key, nil and false render nothing') do
