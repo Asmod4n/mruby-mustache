@@ -211,7 +211,7 @@ tag_of(const std::string_view body, const uint32_t at)
     case '>': return named_token_of(Kind::partial, rest, at, Problem::empty_partial_name);
     case '$': return named_token_of(Kind::block, rest, at, Problem::empty_block_name);
     case '<': return named_token_of(Kind::parent, rest, at, Problem::empty_parent_name);
-    default:
+    default: [[likely]]
       return token_of(Kind::var, body.substr(i), at);
   }
 }
@@ -231,7 +231,7 @@ tokenize(const std::string_view src)
     if (open > pos) out.push_back({Kind::text, (uint32_t)pos, std::string(src.substr(pos, open - pos)), {}, {}});
     const uint32_t at = (uint32_t)open;
     const size_t body = open + d.open.size();
-    if (body < src.size() && src.at(body) == '=') {
+    if (body < src.size() && src.at(body) == '=') [[unlikely]] {
       const size_t close = src.find("=" + d.close, body + 1);
       if (close == std::string_view::npos) [[unlikely]] return Refusal{Problem::unclosed_tag, at};
       const std::optional<Delimiters> next = parse_set_delimiter(src.substr(body + 1, close - body - 1));

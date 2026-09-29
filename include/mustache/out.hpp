@@ -65,7 +65,7 @@ struct Out {
 constexpr Out
 out_over(const std::span<char> buffer)
 {
-  if (buffer.size() <= kEscapeSlack) return Out{buffer.data(), buffer.data()};
+  if (buffer.size() <= kEscapeSlack) [[unlikely]] return Out{buffer.data(), buffer.data()};
   return Out{buffer.data(), buffer.data() + (buffer.size() - kEscapeSlack)};
 }
 

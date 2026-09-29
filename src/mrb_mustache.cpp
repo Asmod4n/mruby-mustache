@@ -107,7 +107,7 @@ tag_invoke(kind_of_tag, MrubyHost &h, const mrb_value v)
 {
   switch (mrb_type(v)) {
     case MRB_TT_FALSE:  return Kind::falsy;
-    case MRB_TT_STRING: return Kind::text;
+    case MRB_TT_STRING: [[likely]] return Kind::text;
     case MRB_TT_INTEGER: return Kind::text;
 #ifndef MRB_NO_FLOAT
     case MRB_TT_FLOAT:  return Kind::text;
@@ -137,7 +137,7 @@ tag_invoke(text_of_tag, MrubyHost &h, const mrb_value v)
       mrb_int len = 0;
       const char *const name = mrb_sym_name_len(h.mrb, mrb_symbol(v), &len);
       if (name == nullptr) [[unlikely]] return {};
-      if ((size_t)len > h.text.size()) return {name, (size_t)len};
+      if ((size_t)len > h.text.size()) [[unlikely]] return {name, (size_t)len};
       return {h.text.data(), (size_t)(std::copy_n(name, len, h.text.data()) - h.text.data())};
     }
     default:
@@ -176,23 +176,23 @@ tag_invoke(fail_tag, MrubyHost &h, const Fault fault, const std::string_view wha
   switch (fault) {
     case Fault::none:
       return;
-    case Fault::over_limit:
+    case Fault::over_limit: [[unlikely]]
       mrb_raisef(mrb, E_ARGUMENT_ERROR, "%l too long (len=%v max=%v)", what.data(), what.size(),
                  mrb_value_from_size_t(mrb, asked), mrb_value_from_size_t(mrb, allowed));
       break;
-    case Fault::no_memory:
+    case Fault::no_memory: [[unlikely]]
       mrb_raisef(mrb, mrb_exc_get_id(mrb, MRB_SYM(NoMemoryError)), "%l: out of memory (len=%v)", what.data(),
                  what.size(), mrb_value_from_size_t(mrb, asked));
       break;
-    case Fault::parse:
+    case Fault::parse: [[unlikely]]
       mrb_raisef(mrb, error_class(mrb, MRB_SYM(ParseError)), "%l at byte %v", what.data(), what.size(),
                  mrb_value_from_size_t(mrb, asked));
       break;
-    case Fault::not_text:
+    case Fault::not_text: [[unlikely]]
       mrb_exc_raise(mrb, mrb_exc_new(mrb, E_TYPE_ERROR, what.data(), (mrb_int)what.size()));
       break;
-    case Fault::too_deep:
-    case Fault::over_work:
+    case Fault::too_deep: [[unlikely]]
+    case Fault::over_work: [[unlikely]]
       mrb_exc_raise(mrb, mrb_exc_new(mrb, error_class(mrb, MRB_SYM(RenderError)), what.data(), (mrb_int)what.size()));
       break;
   }
@@ -213,7 +213,7 @@ size_t
 size_of_argument(mrb_state *mrb, const mrb_value v)
 {
   const mrb_int n = mrb_as_int(mrb, v);
-  if (n < 0) mrb_raise(mrb, E_ARGUMENT_ERROR, "a size cannot be negative");
+  if (n < 0) [[unlikely]] mrb_raise(mrb, E_ARGUMENT_ERROR, "a size cannot be negative");
   return (size_t)n;
 }
 
@@ -354,11 +354,11 @@ template_render(mrb_state *mrb, mrb_value self)
   mrb_value ctx = mrb_nil_value();
   mrb_value partials = mrb_nil_value();
   mrb_get_args(mrb, "|oo", &ctx, &partials);
-  if (!mrb_nil_p(partials) && !mrb_hash_p(partials)) {
+  if (!mrb_nil_p(partials) && !mrb_hash_p(partials)) [[unlikely]] {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "partials must be a Hash or nil");
   }
   Template *const t = mrb_cpp_get<Template>(mrb, self);
-  if (t == nullptr) mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
+  if (t == nullptr) [[unlikely]] mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
   MrubyHost host{mrb, partials, mrb_nil_value(), mrb_nil_value(), {}};
   mustache::Walk<MrubyHost, mrb_value, mrb_sym, MUSTACHE_MAX_DEPTH, MUSTACHE_MAX_PARTIAL_DEPTH> walk(host, t->buffer,
                                                                                                      t->score_max);
@@ -370,7 +370,7 @@ mrb_value
 template_shrink_to_fit(mrb_state *mrb, mrb_value self)
 {
   Template *const t = mrb_cpp_get<Template>(mrb, self);
-  if (t == nullptr) mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
+  if (t == nullptr) [[unlikely]] mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
   t->buffer.shrink_to_fit();
   return self;
 }
