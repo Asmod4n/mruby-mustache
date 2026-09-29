@@ -199,21 +199,21 @@ public:
     run(p, 0, (uint32_t)p.ops.size(), 0, nullptr, nullptr);
     if (fault_ == Fault::none) [[likely]] fault_ = write(host_, buffer_.view(), true);
     switch (fault_) {
-      case Fault::not_text:
+      case Fault::not_text: [[unlikely]]
         fail(host_, fault_, std::string_view("a value is not text"), size_t{0}, size_t{0});
         break;
-      case Fault::too_deep:
+      case Fault::too_deep: [[unlikely]]
         fail(host_, fault_, std::string_view("nesting too deep"), size_t{0}, size_t{0});
         break;
-      case Fault::over_work:
+      case Fault::over_work: [[unlikely]]
         fail(host_, fault_, std::string_view("the render does more work than max_render_score"), score_, score_max_);
         break;
       case Fault::over_limit:
-      case Fault::no_memory:
+      case Fault::no_memory: [[unlikely]]
         if (buffer_.fault != Fault::none)
           fail(host_, fault_, std::string_view("render output"), buffer_.asked, buffer_.allowed);
         break;
-      default:
+      default: [[likely]]
         break;
     }
     return fault_;
@@ -378,7 +378,7 @@ private:
           const std::string_view s = text_of(host_, *v);
           if (s.empty()) break;
           indent_if_pending(ind);
-          if (op.tag == Tag::var) escaped(s);
+          if (op.tag == Tag::var) [[likely]] escaped(s);
           else raw(s);
           break;
         }
@@ -412,7 +412,7 @@ private:
             return false;
           }
           const Program<Key> *const sub = partial(host_, p.keys.at(op.a));
-          if (sub == nullptr) break;
+          if (sub == nullptr) [[unlikely]] break;
           if (!run_indented(*sub, 0, (uint32_t)sub->ops.size(), pd + 1, ind,
                             std::string_view(p.texts).substr(op.c, op.b), nullptr)) [[unlikely]] {
             return false;
@@ -425,7 +425,7 @@ private:
             return false;
           }
           const Program<Key> *const sub = partial(host_, p.keys.at(op.a));
-          if (sub != nullptr) {
+          if (sub != nullptr) [[likely]] {
             const Args frame{&p, op.e, args};
             if (!run_indented(*sub, 0, (uint32_t)sub->ops.size(), pd + 1, ind,
                               std::string_view(p.texts).substr(op.d, op.b), &frame)) [[unlikely]] {

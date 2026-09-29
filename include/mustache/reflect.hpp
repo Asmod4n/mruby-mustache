@@ -51,7 +51,7 @@ consteval Sizes
 sizes_of(const std::string_view src)
 {
   const std::variant<Compiled, Refusal> r = compile(src);
-  if (std::holds_alternative<Refusal>(r)) return {0, 0, 0, 0, true};
+  if (std::holds_alternative<Refusal>(r)) [[unlikely]] return {0, 0, 0, 0, true};
   const Compiled &c = std::get<Compiled>(r);
   size_t keys = 0;
   for (const std::string &k : c.keys) keys += k.size();
@@ -73,7 +73,7 @@ make_static(const std::string_view src)
 {
   StaticProgram<S> p;
   const std::variant<Compiled, Refusal> r = compile(src);
-  if (std::holds_alternative<Refusal>(r)) return p;
+  if (std::holds_alternative<Refusal>(r)) [[unlikely]] return p;
   const Compiled &c = std::get<Compiled>(r);
   for (size_t i = 0; i < S.ops; i++) p.ops.at(i) = c.ops.at(i);
   for (size_t i = 0; i < S.texts; i++) p.texts.at(i) = c.texts.at(i);
@@ -93,7 +93,7 @@ namespace detail {
 consteval std::meta::info
 member_named(std::meta::info type, std::string_view name)
 {
-  if (!std::meta::is_class_type(type)) return std::meta::info{};
+  if (!std::meta::is_class_type(type)) [[unlikely]] return std::meta::info{};
   for (std::meta::info m : std::meta::nonstatic_data_members_of(type, std::meta::access_context::unchecked())) {
     if (std::meta::has_identifier(m) && std::meta::identifier_of(m) == name) return m;
   }
@@ -116,7 +116,7 @@ consteval bool
 is_cxx_keyword(const std::string_view name)
 {
   for (const std::string_view k : kCxxKeywords) {
-    if (k == name) return true;
+    if (k == name) [[unlikely]] return true;
   }
   return false;
 }
@@ -461,7 +461,7 @@ static_length()
     const size_t n = (size_t)(out.w - buffer);
     const bool full = out.full;
     delete[] buffer;
-    if (!full) return n;
+    if (!full) [[likely]] return n;
   }
 }
 
