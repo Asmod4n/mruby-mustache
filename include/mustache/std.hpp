@@ -40,63 +40,12 @@ struct KeyEqual {
 };
 
 struct Value;
-struct Entry;
 using List = std::vector<Value>;
-
-class Map {
-public:
-  void set(std::string key, Value value);
-  const Value *find(const Key &key) const;
-  bool empty() const;
-  size_t size() const;
-
-private:
-  std::vector<Entry> entries_;
-};
+using Map = std::unordered_map<std::string, Value, KeyHash, KeyEqual>;
 
 struct Value {
   std::variant<std::string, List, Map, bool, std::int64_t, double, std::nullptr_t> v;
 };
-
-struct Entry {
-  size_t      hash;
-  std::string key;
-  Value       value;
-};
-
-inline bool
-Map::empty() const
-{
-  return entries_.empty();
-}
-
-inline size_t
-Map::size() const
-{
-  return entries_.size();
-}
-
-inline void
-Map::set(std::string key, Value value)
-{
-  const size_t hash = KeyHash{}(std::string_view(key));
-  for (Entry &e : entries_) {
-    if (e.hash == hash && e.key == key) {
-      e.value = std::move(value);
-      return;
-    }
-  }
-  entries_.push_back(Entry{hash, std::move(key), std::move(value)});
-}
-
-inline const Value *
-Map::find(const Key &key) const
-{
-  for (const Entry &e : entries_) {
-    if (e.hash == key.hash && e.key == key.name) return &e.value;
-  }
-  return nullptr;
-}
 
 struct Host {
   const std::unordered_map<std::string, const Program<Key> *, KeyHash, KeyEqual> *partials = nullptr;
@@ -126,9 +75,9 @@ tag_invoke(find_tag, Host &, const Value *const v, const Key &key)
 {
   const Map *const map = std::get_if<Map>(&v->v);
   if (map == nullptr) return std::nullopt;
-  const Value *const found = map->find(key);
-  if (found == nullptr) return std::nullopt;
-  return found;
+  const auto found = map->find(key);
+  if (found == map->end()) return std::nullopt;
+  return &found->second;
 }
 
 inline Kind

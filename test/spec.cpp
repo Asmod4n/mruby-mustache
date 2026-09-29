@@ -30,7 +30,7 @@ value_of(simdjson::ondemand::value v)
       Map m;
       for (auto field : v.get_object()) {
         const std::string key(field.unescaped_key().value());
-        m.set(key, value_of(field.value()));
+        m.insert_or_assign(key, value_of(field.value()));
       }
       return Value{std::move(m)};
     }
