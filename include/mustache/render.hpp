@@ -268,19 +268,19 @@ private:
 
   void text(const std::string_view all, Indent *const ind)
   {
-    if (ind == nullptr) [[likely]] {
-      raw(all);
+    if (ind != nullptr) [[unlikely]] {
+      std::string_view s = all;
+      while (!s.empty()) {
+        const size_t nl = s.find('\n');
+        const size_t line = nl == std::string_view::npos ? s.size() : nl + 1;
+        indent_if_pending(ind);
+        raw(s.substr(0, line));
+        if (nl != std::string_view::npos) ind->pending = true;
+        s.remove_prefix(line);
+      }
       return;
     }
-    std::string_view s = all;
-    while (!s.empty()) {
-      const size_t nl = s.find('\n');
-      const size_t line = nl == std::string_view::npos ? s.size() : nl + 1;
-      indent_if_pending(ind);
-      raw(s.substr(0, line));
-      if (nl != std::string_view::npos) ind->pending = true;
-      s.remove_prefix(line);
-    }
+    raw(all);
   }
 
   std::optional<Value> lookup(const Program<Key> &p, const Op &op)

@@ -96,7 +96,7 @@ tag_invoke(write_tag, MrubyHost &h, const std::string_view bytes, const bool)
 inline std::optional<mrb_value>
 tag_invoke(find_tag, MrubyHost &h, const mrb_value map, const mrb_sym key)
 {
-  if (!mrb_hash_p(map)) return std::nullopt;
+  if (!mrb_hash_p(map)) [[unlikely]] return std::nullopt;
   const mrb_value v = mrb_hash_fetch(h.mrb, map, mrb_symbol_value(key), mrb_undef_value());
   if (mrb_undef_p(v)) return std::nullopt;
   return v;
