@@ -4,6 +4,8 @@
 
 #include <benchmark/benchmark.h>
 
+#include "walk2.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -248,6 +250,32 @@ program()
 
 const mustache::Program<Key> kProgram = program();
 
+// std_host in every tag but find and found: find gives nullptr where it
+// finds nothing, and found asks for that.
+struct ValueHost : Host {};
+
+const Value *
+tag_invoke(mustache::find_tag, ValueHost &, const Value *const v, const Key &key)
+{
+  const Map *const map = std::get_if<Map>(&v->v);
+  if (map == nullptr) return nullptr;
+  const auto it = map->find(key);
+  return it == map->end() ? nullptr : &it->second;
+}
+
+bool
+tag_invoke(mustache::found_tag, ValueHost &, const Value *const v)
+{
+  return v != nullptr;
+}
+
+std::string
+rendered_by_walk2(ValueHost &h, const size_t capacity)
+{
+  mustache::Walk2<ValueHost, const Value *, Key>(h, mustache::kMaxRenderScore, capacity).run(kProgram, &kRoot);
+  return std::move(h.answer);
+}
+
 std::string
 rendered_by_walk(Host &h, const size_t capacity)
 {
@@ -378,6 +406,19 @@ walk(benchmark::State &state)
 }
 
 void
+walk_value(benchmark::State &state)
+{
+  ValueHost h;
+  size_t last = mustache::kInitialCapacity;
+  for (auto _ : state) {
+    std::string answer = rendered_by_walk2(h, last);
+    last = answer.size();
+    benchmark::DoNotOptimize(answer.data());
+    benchmark::ClobberMemory();
+  }
+}
+
+void
 c_api(benchmark::State &state)
 {
   CUser user;
@@ -408,6 +449,7 @@ reflection(benchmark::State &state)
 }
 
 BENCHMARK(walk);
+BENCHMARK(walk_value);
 BENCHMARK(c_api);
 #ifdef __cpp_impl_reflection
 BENCHMARK(reflection);
@@ -421,7 +463,9 @@ main(int argc, char **argv)
   const std::string expected = rendered_by_walk(h, mustache::kInitialCapacity);
   mustache_template *const tpl = compiled_for_c();
   CUser user;
-  const bool same = rendered_by_c_api(tpl, user) == expected
+  ValueHost vh;
+  const bool same = rendered_by_c_api(tpl, user) == expected &&
+                    rendered_by_walk2(vh, mustache::kInitialCapacity) == expected
 #ifdef __cpp_impl_reflection
                     && rendered_by_reflection(h, mustache::kInitialCapacity) == expected
 #endif
