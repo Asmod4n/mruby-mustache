@@ -9,7 +9,7 @@ foreach(module comments delimiters interpolation inverted partials sections ~inh
 endforeach()
 
 add_executable(output output.cpp)
-target_link_libraries(output PRIVATE mustache::mustache)
+target_link_libraries(output PRIVATE mustache::mustache mustache::mustache-c)
 add_test(NAME output COMMAND output)
 
 add_executable(c_api c_api.c)

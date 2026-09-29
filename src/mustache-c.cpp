@@ -1,10 +1,12 @@
 #include <mustache-c/mustache.h>
 
-#include <mustache/render.hpp>
+#include <mustache/steps.hpp>
 
+#include <array>
+#include <bit>
 #include <cerrno>
-#include <memory>
-#include <memory_resource>
+#include <cstdint>
+#include <cstring>
 #include <new>
 #include <optional>
 #include <span>
@@ -17,28 +19,9 @@ struct Key {
   std::string name;
 };
 
-struct Callbacks {
-  const void *(*find)(void *, const void *, const char *, size_t);
-  int (*kind)(void *, const void *);
-  const char *(*text)(void *, const void *, size_t *);
-  size_t (*size)(void *, const void *);
-  const void *(*element)(void *, const void *, size_t);
-  char *(*new_string)(void *, size_t, void **, size_t *);
-  char *(*grow)(void *, void **, size_t, size_t, size_t *);
-  int (*done)(void *, void *, size_t);
-};
-
 struct Host {
-  const Callbacks &callbacks;
-  void            *user;
-  size_t           capacity_hint;
-  void            *string = nullptr;
-  size_t           size = 0;
-  int              done_errno = 0;
   Fault            fault = Fault::none;
   std::string_view what{};
-  size_t           asked = 0;
-  size_t           allowed = 0;
 };
 
 inline Key
@@ -47,84 +30,14 @@ tag_invoke(key_of_tag, Host &, const std::string_view name)
   return {std::string(name)};
 }
 
-inline std::optional<const void *>
-tag_invoke(find_tag, Host &h, const void *const v, const Key &key)
-{
-  const void *const found = h.callbacks.find(h.user, v, key.name.data(), key.name.size());
-  if (found == nullptr) return std::nullopt;
-  return found;
-}
-
-inline Kind
-tag_invoke(kind_of_tag, Host &h, const void *const v)
-{
-  const int kind = h.callbacks.kind(h.user, v);
-  if (kind < MUSTACHE_FALSY || kind > MUSTACHE_TRUTHY) [[unlikely]] return Kind::falsy;
-  return static_cast<Kind>(kind);
-}
-
-inline std::string_view
-tag_invoke(text_of_tag, Host &h, const void *const v)
-{
-  size_t size = 0;
-  const char *const text = h.callbacks.text(h.user, v, &size);
-  if (text == nullptr) [[unlikely]] return {};
-  return {text, size};
-}
-
-inline size_t
-tag_invoke(size_of_tag, Host &h, const void *const v)
-{
-  return h.callbacks.size(h.user, v);
-}
-
-inline const void *
-tag_invoke(element_tag, Host &h, const void *const v, const size_t i)
-{
-  return h.callbacks.element(h.user, v, i);
-}
-
-inline const Program<Key> *
-tag_invoke(partial_tag, Host &, const Key &)
-{
-  return nullptr;
-}
-
 inline void
-tag_invoke(fail_tag, Host &h, const Fault fault, const std::string_view what, const size_t asked,
-           const size_t allowed)
+tag_invoke(fail_tag, Host &h, const Fault fault, const std::string_view what, const size_t, const size_t)
 {
   h.fault = fault;
   h.what = what;
-  h.asked = asked;
-  h.allowed = allowed;
 }
 
-inline std::span<char>
-tag_invoke(new_string_tag, Host &h, const size_t capacity)
-{
-  size_t real_capacity = 0;
-  char *const bytes = h.callbacks.new_string(h.user, std::max(capacity, h.capacity_hint + kEscapeSlack), &h.string, &real_capacity);
-  if (bytes == nullptr) [[unlikely]] return {};
-  return {bytes, real_capacity};
-}
-
-inline std::span<char>
-tag_invoke(grow_tag, Host &h, const size_t size, const size_t capacity)
-{
-  size_t real_capacity = 0;
-  char *const bytes = h.callbacks.grow(h.user, &h.string, size, capacity, &real_capacity);
-  if (bytes == nullptr) [[unlikely]] return {};
-  return {bytes, real_capacity};
-}
-
-inline Fault
-tag_invoke(done_tag, Host &h, const size_t size)
-{
-  h.size = size;
-  if (h.callbacks.done(h.user, h.string, size) != 0) [[unlikely]] h.done_errno = errno;
-  return Fault::none;
-}
+inline constexpr uint64_t kMagic = std::bit_cast<uint64_t>(std::array<char, 8>{'m', 'u', 's', 't', 'a', 'c', 'h', 'e'});
 
 constexpr int
 errno_of(const Fault fault)
@@ -141,21 +54,15 @@ errno_of(const Fault fault)
   return EINVAL;
 }
 
-constexpr bool
-is_complete(const Callbacks &c)
-{
-  return c.find != nullptr && c.kind != nullptr && c.text != nullptr && c.size != nullptr && c.element != nullptr &&
-         c.new_string != nullptr && c.grow != nullptr && c.done != nullptr;
-}
-
 }
 
 struct mustache_template {
-  std::optional<mustache::Program<mustache::c_host::Key>> program;
-  mustache::c_host::Callbacks                                callbacks{};
-  std::string_view                                           message;
-  size_t                                                     last_size = mustache::kInitialCapacity;
-  std::pmr::synchronized_pool_resource                       pool;
+  uint64_t                                                     magic = mustache::c_host::kMagic;
+  std::optional<mustache::Program<mustache::c_host::Key>>      program;
+  mustache::Steps<const void *, mustache::c_host::Key>         steps;
+  std::optional<mustache::Request>                             awaiting;
+  std::string_view                                             message;
+  size_t                                                       last_size = mustache::kInitialCapacity;
 };
 
 namespace {
@@ -167,13 +74,13 @@ failed(const int error)
   return -1;
 }
 
-template <class Callback>
-int
-set_callback(mustache_template *const tpl, Callback mustache::c_host::Callbacks::*const member, const Callback callback)
+bool
+is_template(const void *const handle)
 {
-  if (tpl == nullptr || callback == nullptr) [[unlikely]] return failed(EINVAL);
-  tpl->callbacks.*member = callback;
-  return 0;
+  if (handle == nullptr) [[unlikely]] return false;
+  uint64_t magic = 0;
+  std::memcpy(&magic, handle, sizeof magic);
+  return magic == mustache::c_host::kMagic;
 }
 
 }
@@ -184,8 +91,7 @@ mustache_compile(const char *const source, const size_t size, mustache_template 
   if (tpl == nullptr || (source == nullptr && size != 0)) [[unlikely]] return failed(EINVAL);
   *tpl = new (std::nothrow) mustache_template();
   if (*tpl == nullptr) [[unlikely]] return failed(ENOMEM);
-  const mustache::c_host::Callbacks none{};
-  mustache::c_host::Host host{none, nullptr, 0};
+  mustache::c_host::Host host;
   (*tpl)->program =
       mustache::program_of<mustache::c_host::Key>(host, std::string_view(source, size), mustache::kSourceMax);
   if (!(*tpl)->program) [[unlikely]] {
@@ -198,6 +104,8 @@ mustache_compile(const char *const source, const size_t size, mustache_template 
 extern "C" int
 mustache_dispose_template(mustache_template *const tpl)
 {
+  if (!is_template(tpl)) [[unlikely]] return failed(EBADF);
+  tpl->magic = 0;
   delete tpl;
   return 0;
 }
@@ -205,91 +113,112 @@ mustache_dispose_template(mustache_template *const tpl)
 extern "C" int
 mustache_message(const mustache_template *const tpl, const char **const message, size_t *const size)
 {
-  if (tpl == nullptr || message == nullptr || size == nullptr) [[unlikely]] return failed(EINVAL);
+  if (!is_template(tpl)) [[unlikely]] return failed(EBADF);
+  if (message == nullptr || size == nullptr) [[unlikely]] return failed(EINVAL);
   *message = tpl->message.data();
   *size = tpl->message.size();
   return 0;
 }
 
 extern "C" int
-mustache_set_find(mustache_template *const tpl, const void *(*const find)(void *, const void *, const char *, size_t))
+mustache_render(mustache_template *const tpl, const void *const root)
 {
-  return set_callback(tpl, &mustache::c_host::Callbacks::find, find);
+  if (!is_template(tpl)) [[unlikely]] return failed(EBADF);
+  if (tpl->steps.is_running()) [[unlikely]] return failed(EBUSY);
+  if (!tpl->program) [[unlikely]] return failed(EILSEQ);
+  tpl->message = {};
+  tpl->awaiting = std::nullopt;
+  tpl->steps.initial_capacity = tpl->last_size;
+  tpl->steps.start(*tpl->program, root);
+  return 0;
 }
 
 extern "C" int
-mustache_set_kind(mustache_template *const tpl, int (*const kind)(void *, const void *))
+mustache_next(mustache_template *const tpl, const void **const value, const char **const text, size_t *const size,
+              size_t *const capacity)
 {
-  return set_callback(tpl, &mustache::c_host::Callbacks::kind, kind);
+  if (!is_template(tpl)) [[unlikely]] return failed(EBADF);
+  if (value == nullptr || text == nullptr || size == nullptr || capacity == nullptr) [[unlikely]] return failed(EINVAL);
+  if (tpl->awaiting) [[unlikely]] return failed(EINVAL);
+  const mustache::Ask<const void *> ask = tpl->steps.next();
+  *value = ask.value;
+  *text = ask.text.data();
+  *size = ask.size;
+  *capacity = ask.capacity;
+  switch (ask.request) {
+    case mustache::Request::find:
+      *size = ask.text.size();
+      tpl->awaiting = ask.request;
+      return MUSTACHE_FIND;
+    case mustache::Request::kind:       tpl->awaiting = ask.request; return MUSTACHE_KIND;
+    case mustache::Request::text:       tpl->awaiting = ask.request; return MUSTACHE_TEXT;
+    case mustache::Request::size:       tpl->awaiting = ask.request; return MUSTACHE_SIZE;
+    case mustache::Request::element:    tpl->awaiting = ask.request; return MUSTACHE_ELEMENT;
+    case mustache::Request::partial:
+      *size = ask.text.size();
+      tpl->awaiting = ask.request;
+      return MUSTACHE_PARTIAL;
+    case mustache::Request::new_string: tpl->awaiting = ask.request; return MUSTACHE_NEW_STRING;
+    case mustache::Request::grow:       tpl->awaiting = ask.request; return MUSTACHE_GROW;
+    case mustache::Request::done:
+      tpl->last_size = ask.size;
+      return MUSTACHE_DONE;
+    case mustache::Request::finished:   return MUSTACHE_RENDER;
+    case mustache::Request::failed:
+      tpl->message = tpl->steps.what();
+      return failed(mustache::c_host::errno_of(tpl->steps.fault()));
+  }
+  return MUSTACHE_RENDER;
 }
 
 extern "C" int
-mustache_set_text(mustache_template *const tpl, const char *(*const text)(void *, const void *, size_t *))
+mustache_answer(mustache_template *const tpl, const void *const value, const char *const text, const size_t size)
 {
-  return set_callback(tpl, &mustache::c_host::Callbacks::text, text);
+  if (!is_template(tpl)) [[unlikely]] return failed(EBADF);
+  if (!tpl->awaiting) [[unlikely]] return failed(EINVAL);
+  switch (*tpl->awaiting) {
+    case mustache::Request::find:
+      tpl->steps.found(value == nullptr ? std::nullopt : std::optional<const void *>(value));
+      break;
+    case mustache::Request::element:
+      tpl->steps.found(value);
+      break;
+    case mustache::Request::kind:
+      if (size > MUSTACHE_KIND_TRUTHY) [[unlikely]] return failed(EINVAL);
+      tpl->steps.kind_is(static_cast<mustache::Kind>(size));
+      break;
+    case mustache::Request::text:
+      if (text == nullptr && size != 0) [[unlikely]] return failed(EINVAL);
+      tpl->steps.text_is(std::string_view(text, size));
+      break;
+    case mustache::Request::size:
+      tpl->steps.size_is(size);
+      break;
+    case mustache::Request::partial:
+      if (value == nullptr) {
+        tpl->steps.partial_is(nullptr);
+        break;
+      }
+      if (!is_template(value)) [[unlikely]] return failed(EBADF);
+      tpl->steps.partial_is(static_cast<const mustache_template *>(value)->program
+                                ? &*static_cast<const mustache_template *>(value)->program
+                                : nullptr);
+      break;
+    default:
+      return failed(EINVAL);
+  }
+  tpl->awaiting = std::nullopt;
+  return 0;
 }
 
 extern "C" int
-mustache_set_size(mustache_template *const tpl, size_t (*const size)(void *, const void *))
+mustache_answer_string(mustache_template *const tpl, char *const bytes, const size_t capacity)
 {
-  return set_callback(tpl, &mustache::c_host::Callbacks::size, size);
-}
-
-extern "C" int
-mustache_set_element(mustache_template *const tpl, const void *(*const element)(void *, const void *, size_t))
-{
-  return set_callback(tpl, &mustache::c_host::Callbacks::element, element);
-}
-
-extern "C" int
-mustache_set_new_string(mustache_template *const tpl, char *(*const new_string)(void *, size_t, void **, size_t *))
-{
-  return set_callback(tpl, &mustache::c_host::Callbacks::new_string, new_string);
-}
-
-extern "C" int
-mustache_set_grow(mustache_template *const tpl, char *(*const grow)(void *, void **, size_t, size_t, size_t *))
-{
-  return set_callback(tpl, &mustache::c_host::Callbacks::grow, grow);
-}
-
-extern "C" int
-mustache_set_done(mustache_template *const tpl, int (*const done)(void *, void *, size_t))
-{
-  return set_callback(tpl, &mustache::c_host::Callbacks::done, done);
-}
-
-extern "C" int
-mustache_render(mustache_template *const tpl, const void *const root, void (*const release)(const void *),
-                void *const user, void **const string)
-{
-  if (tpl == nullptr || string == nullptr || !mustache::c_host::is_complete(tpl->callbacks)) [[unlikely]] {
-    if (release != nullptr) release(root);
+  if (!is_template(tpl)) [[unlikely]] return failed(EBADF);
+  if (tpl->awaiting != mustache::Request::new_string && tpl->awaiting != mustache::Request::grow) [[unlikely]] {
     return failed(EINVAL);
   }
-  if (!tpl->program) [[unlikely]] {
-    if (release != nullptr) release(root);
-    return failed(EILSEQ);
-  }
-  std::shared_ptr<const void> held;
-  try {
-    held = std::shared_ptr<const void>(
-        root,
-        [release](const void *const r) {
-          if (release != nullptr) release(r);
-        },
-        std::pmr::polymorphic_allocator<std::byte>(&tpl->pool));
-  }
-  catch (const std::bad_alloc &) {
-    return failed(ENOMEM);
-  }
-  mustache::c_host::Host host{tpl->callbacks, user, tpl->last_size};
-  const mustache::Fault fault =
-      mustache::Walk<mustache::c_host::Host, const void *, mustache::c_host::Key>(host).run(*tpl->program, held.get());
-  *string = host.string;
-  tpl->message = host.what;
-  if (fault != mustache::Fault::none) [[unlikely]] return failed(mustache::c_host::errno_of(fault));
-  if (host.done_errno != 0) [[unlikely]] return failed(host.done_errno);
-  tpl->last_size = host.size;
+  tpl->steps.string_is(bytes == nullptr ? std::span<char>() : std::span<char>(bytes, capacity));
+  tpl->awaiting = std::nullopt;
   return 0;
 }
