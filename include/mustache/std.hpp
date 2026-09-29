@@ -1,7 +1,11 @@
 #pragma once
 
+#include <array>
+#include <charconv>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -51,7 +55,7 @@ private:
 };
 
 struct Value {
-  std::variant<std::string, List, Map, bool> v;
+  std::variant<std::string, List, Map, bool, std::int64_t, double, std::nullptr_t> v;
 };
 
 struct Entry {
@@ -101,6 +105,7 @@ struct Host {
   size_t           asked = 0;
   size_t           allowed = 0;
   std::string      answer;
+  std::array<char, 32> text{};
 };
 
 inline Fault
@@ -133,14 +138,27 @@ tag_invoke(kind_of_tag, Host &, const Value *const v)
     case 0:  return Kind::text;
     case 1:  return Kind::list;
     case 2:  return std::get<Map>(v->v).empty() ? Kind::falsy : Kind::map;
-    default: return std::get<bool>(v->v) ? Kind::truthy : Kind::falsy;
+    case 3:  return std::get<bool>(v->v) ? Kind::truthy : Kind::falsy;
+    case 4:
+    case 5:  return Kind::text;
+    default: return Kind::falsy;
   }
 }
 
 inline std::string_view
-tag_invoke(text_of_tag, Host &, const Value *const v)
+tag_invoke(text_of_tag, Host &h, const Value *const v)
 {
-  return std::get<std::string>(v->v);
+  switch (v->v.index()) {
+    case 4: {
+      const auto [end, ec] = std::to_chars(h.text.data(), std::to_address(h.text.end()), std::get<std::int64_t>(v->v));
+      return {h.text.data(), end};
+    }
+    case 5: {
+      const auto [end, ec] = std::to_chars(h.text.data(), std::to_address(h.text.end()), std::get<double>(v->v));
+      return {h.text.data(), end};
+    }
+    default: return std::get<std::string>(v->v);
+  }
 }
 
 inline size_t
