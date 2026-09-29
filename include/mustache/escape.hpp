@@ -96,7 +96,7 @@ escape_into(char *const out, const std::string_view s)
     const __m256i b = _mm256_loadu_si256((const __m256i *)(src + at));
     uint32_t mask = marks_of(b);
     _mm256_storeu_si256((__m256i *)w, b);
-    if (mask == 0) [[likely]] {
+    if (mask == 0) {
       w += 32;
       continue;
     }
@@ -148,7 +148,7 @@ escape_into(char *const out, const std::string_view s)
     const uint8x16_t b = vld1q_u8(src + at);
     uint64_t mask = marks_of(b) & 0x8888888888888888ull;
     vst1q_u8((uint8_t *)w, b);
-    if (mask == 0) [[likely]] {
+    if (mask == 0) {
       w += 16;
       continue;
     }

@@ -461,7 +461,7 @@ static_length()
     const size_t n = (size_t)(out.w - buffer);
     const bool full = out.full;
     delete[] buffer;
-    if (!full) [[likely]] return n;
+    if (!full) return n;
   }
 }
 

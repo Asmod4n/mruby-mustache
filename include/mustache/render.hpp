@@ -213,7 +213,7 @@ public:
         if (buffer_.fault != Fault::none)
           fail(host_, fault_, std::string_view("render output"), buffer_.asked, buffer_.allowed);
         break;
-      default: [[likely]]
+      default:
         break;
     }
     return fault_;
@@ -378,7 +378,7 @@ private:
           const std::string_view s = text_of(host_, *v);
           if (s.empty()) break;
           indent_if_pending(ind);
-          if (op.tag == Tag::var) [[likely]] escaped(s);
+          if (op.tag == Tag::var) escaped(s);
           else raw(s);
           break;
         }
@@ -425,7 +425,7 @@ private:
             return false;
           }
           const Program<Key> *const sub = partial(host_, p.keys.at(op.a));
-          if (sub != nullptr) [[likely]] {
+          if (sub != nullptr) {
             const Args frame{&p, op.e, args};
             if (!run_indented(*sub, 0, (uint32_t)sub->ops.size(), pd + 1, ind,
                               std::string_view(p.texts).substr(op.d, op.b), &frame)) [[unlikely]] {

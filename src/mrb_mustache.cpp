@@ -107,7 +107,7 @@ tag_invoke(kind_of_tag, MrubyHost &h, const mrb_value v)
 {
   switch (mrb_type(v)) {
     case MRB_TT_FALSE:  return Kind::falsy;
-    case MRB_TT_STRING: [[likely]] return Kind::text;
+    case MRB_TT_STRING: return Kind::text;
     case MRB_TT_INTEGER: return Kind::text;
 #ifndef MRB_NO_FLOAT
     case MRB_TT_FLOAT:  return Kind::text;
