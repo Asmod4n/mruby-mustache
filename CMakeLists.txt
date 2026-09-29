@@ -14,3 +14,8 @@ install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT mustache-targets NAMESPACE mustache:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/mustache
   FILE mustache-config.cmake)
 
+
+include(CTest)
+if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
+  add_subdirectory(test)
+endif()
