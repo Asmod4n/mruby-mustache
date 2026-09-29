@@ -132,6 +132,21 @@ struct is_optional : std::false_type {};
 template <class T>
 struct is_optional<std::optional<T>> : std::true_type {};
 
+template <int Depth>
+consteval void nests_too_deep() = delete("partials, parents or blocks nest deeper than 64");
+
+template <fixed_string Source>
+consteval void does_not_compile() = delete("a template does not compile");
+
+template <fixed_string Key>
+consteval void names_a_cxx_keyword() = delete("a key is a C++ keyword, which no member can be named");
+
+template <fixed_string Key>
+consteval void names_no_member() = delete("a key names no member of any context");
+
+template <class Value>
+consteval void is_not_text() = delete("a value is not text");
+
 }
 
 template <fixed_string Name, fixed_string Source>
@@ -216,9 +231,6 @@ inline constexpr int kMaxStaticDepth = 64;
 template <fixed_string Src, class Partials = static_partial_list<>, class Args = no_frame, class Indent = no_indent,
           int Depth = 0>
 struct Renderer {
-  static_assert(Depth <= kMaxStaticDepth, "partials, parents or blocks nest deeper than 64");
-  static_assert(!static_program_of<Src>.refused, "a template does not compile");
-
   static constexpr const auto &P = static_program_of<Src>;
   static constexpr bool kIndented = !std::is_same_v<Indent, no_indent>;
 
@@ -248,10 +260,16 @@ struct Renderer {
     if constexpr (j == count) {
       return v;
     }
+    else if constexpr (detail::is_cxx_keyword(key(first + j))) {
+      detail::names_a_cxx_keyword<fixed_of<key(first + j).size()>(key(first + j))>();
+      return v;
+    }
+    else if constexpr (detail::member_named(^^T, key(first + j)) == std::meta::info{}) {
+      detail::names_no_member<fixed_of<key(first + j).size()>(key(first + j))>();
+      return v;
+    }
     else {
-      static_assert(!detail::is_cxx_keyword(key(first + j)), "a key is a C++ keyword, which no member can be named");
       constexpr std::meta::info m = detail::member_named(^^T, key(first + j));
-      static_assert(m != std::meta::info{}, "a key segment names no member");
       return follow<first, count, j + 1>(v.[:m:]);
     }
   }
@@ -262,10 +280,16 @@ struct Renderer {
     if constexpr (count == 0) {
       return std::get<sizeof...(Ctx) - 1>(std::tie(ctx...));
     }
+    else if constexpr (detail::is_cxx_keyword(key(first))) {
+      detail::names_a_cxx_keyword<fixed_of<key(first).size()>(key(first))>();
+      return std::get<sizeof...(Ctx) - 1>(std::tie(ctx...));
+    }
+    else if constexpr (innermost<Ctx...>(key(first)) < 0) {
+      detail::names_no_member<fixed_of<key(first).size()>(key(first))>();
+      return std::get<sizeof...(Ctx) - 1>(std::tie(ctx...));
+    }
     else {
-      static_assert(!detail::is_cxx_keyword(key(first)), "a key is a C++ keyword, which no member can be named");
       constexpr int i = innermost<Ctx...>(key(first));
-      static_assert(i >= 0, "a key names no member of any context");
       const auto &base = std::get<i>(std::tie(ctx...));
       constexpr std::meta::info m = detail::member_named(^^std::remove_cvref_t<decltype(base)>, key(first));
       return follow<first, count, 1>(base.[:m:]);
@@ -333,7 +357,13 @@ struct Renderer {
             class W, class... Ctx>
   static constexpr void run_nested(W &out, bool &pending, const Ctx &...ctx)
   {
-    if constexpr (IndentLength == 0) {
+    if constexpr (Depth + 1 > kMaxStaticDepth) {
+      detail::nests_too_deep<Depth + 1>();
+    }
+    else if constexpr (static_program_of<Source>.refused) {
+      detail::does_not_compile<Source>();
+    }
+    else if constexpr (IndentLength == 0) {
       indent_if_pending(out, pending);
       Renderer<Source, Partials, InnerArgs, Indent, Depth + 1>::template run<From, Stop>(out, pending, ctx...);
     }
@@ -361,11 +391,13 @@ struct Renderer {
         const auto &v = lookup<op.a, op.b>(ctx...);
         using V = std::remove_cvref_t<decltype(v)>;
         if constexpr (detail::is_optional<V>::value) {
-          static_assert(detail::text_like<typename V::value_type>, "a value is not text");
-          if (v) value<op.tag>(out, pending, std::string_view(*v));
+          if constexpr (!detail::text_like<typename V::value_type>) detail::is_not_text<V>();
+          else if (v) value<op.tag>(out, pending, std::string_view(*v));
+        }
+        else if constexpr (!detail::text_like<V>) {
+          detail::is_not_text<V>();
         }
         else {
-          static_assert(detail::text_like<V>, "a value is not text");
           value<op.tag>(out, pending, std::string_view(v));
         }
         run<pc + 1, stop>(out, pending, ctx...);
@@ -436,6 +468,7 @@ template <fixed_string Src, class... Partials, class Host, class T>
 [[nodiscard]] Fault
 render(Host &host, Buffer &buffer, const T &data)
 {
+  if constexpr (static_program_of<Src>.refused) detail::does_not_compile<Src>();
   buffer.clear();
   bool pending = false;
   Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(
@@ -452,6 +485,7 @@ template <fixed_string Src, auto Make, class... Partials>
 consteval size_t
 static_length()
 {
+  if constexpr (static_program_of<Src>.refused) detail::does_not_compile<Src>();
   for (size_t capacity = 4096;; capacity *= 2) {
     char *buffer = new char[capacity + kSlack];
     Out out{buffer, buffer + capacity};

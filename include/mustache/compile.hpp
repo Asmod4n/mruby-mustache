@@ -527,7 +527,7 @@ blocks_dedented(Stripped s)
   return s;
 }
 
-} // namespace detail
+}
 
 constexpr std::variant<Compiled, Refusal>
 compile(const std::string_view src)
@@ -621,4 +621,4 @@ compile(const std::string_view src)
   return out;
 }
 
-} // namespace mustache
+}
