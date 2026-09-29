@@ -211,7 +211,7 @@ tag_of(const std::string_view body, const uint32_t at)
     case '>': return named_token_of(Kind::partial, rest, at, Problem::empty_partial_name);
     case '$': return named_token_of(Kind::block, rest, at, Problem::empty_block_name);
     case '<': return named_token_of(Kind::parent, rest, at, Problem::empty_parent_name);
-    default: [[likely]]
+    default:
       return token_of(Kind::var, body.substr(i), at);
   }
 }
