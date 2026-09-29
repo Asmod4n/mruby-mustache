@@ -13,6 +13,7 @@
 
 #include "compile.hpp"
 #include "out.hpp"
+#include "render.hpp"
 
 namespace mustache {
 
@@ -289,7 +290,8 @@ struct Renderer {
     }
   }
 
-  static constexpr void indent_if_pending(Out &out, bool &pending)
+  template <class W>
+  static constexpr void indent_if_pending(W &out, bool &pending)
   {
     if constexpr (kIndented) {
       if (pending) {
@@ -299,7 +301,8 @@ struct Renderer {
     }
   }
 
-  static constexpr void text(Out &out, bool &pending, const std::string_view all)
+  template <class W>
+  static constexpr void text(W &out, bool &pending, const std::string_view all)
   {
     if constexpr (!kIndented) {
       out.raw(all);
@@ -317,8 +320,8 @@ struct Renderer {
     }
   }
 
-  template <Tag tag>
-  static constexpr void value(Out &out, bool &pending, const std::string_view s)
+  template <Tag tag, class W>
+  static constexpr void value(W &out, bool &pending, const std::string_view s)
   {
     if (s.empty()) return;
     indent_if_pending(out, pending);
@@ -327,8 +330,8 @@ struct Renderer {
   }
 
   template <fixed_string Source, class InnerArgs, uint32_t IndentLength, uint32_t IndentAt, uint32_t From, uint32_t Stop,
-            class... Ctx>
-  static constexpr void run_nested(Out &out, bool &pending, const Ctx &...ctx)
+            class W, class... Ctx>
+  static constexpr void run_nested(W &out, bool &pending, const Ctx &...ctx)
   {
     if constexpr (IndentLength == 0) {
       indent_if_pending(out, pending);
@@ -342,10 +345,13 @@ struct Renderer {
     }
   }
 
-  template <uint32_t pc, uint32_t stop, class... Ctx>
-  static constexpr void run(Out &out, bool &pending, const Ctx &...ctx)
+  template <uint32_t pc, uint32_t stop, class W, class... Ctx>
+  static constexpr void run(W &out, bool &pending, const Ctx &...ctx)
   {
     if constexpr (pc < stop) {
+      if constexpr (requires { out.fault(); }) {
+        if (out.fault() != Fault::none) [[unlikely]] return;
+      }
       constexpr Op op = P.ops.at(pc);
       if constexpr (op.tag == Tag::text) {
         text(out, pending, text_at(op.a, op.b));
@@ -426,13 +432,70 @@ struct Renderer {
   }
 };
 
-template <fixed_string Src, class... Partials, class T>
-constexpr void
-render(Out &out, const T &data)
+template <class Host>
+class Chunked {
+public:
+  explicit Chunked(Host &host) : host_(host) {}
+
+  Fault fault() const { return fault_; }
+
+  void raw(const std::string_view s)
+  {
+    if (s.size() > room()) [[unlikely]] {
+      if (!written(false)) return;
+      if (s.size() > kChunk) {
+        const Fault f = write(host_, s, false);
+        if (f != Fault::none) [[unlikely]] fault_ = f;
+        return;
+      }
+    }
+    w_ = std::copy_n(s.begin(), s.size(), w_);
+  }
+
+  void escaped(const std::string_view s)
+  {
+    std::string_view rest = s;
+    while (!rest.empty()) {
+      const size_t take = std::min(rest.size(), room() / kEntityMax);
+      if (take == 0) [[unlikely]] {
+        if (!written(false)) return;
+        continue;
+      }
+      w_ = escaped_into(w_, rest.substr(0, take));
+      rest.remove_prefix(take);
+    }
+  }
+
+  bool written(const bool last)
+  {
+    const Fault f = write(host_, std::string_view(buffer_.data(), (size_t)(w_ - buffer_.data())), last);
+    w_ = buffer_.data();
+    if (f != Fault::none) [[unlikely]] {
+      fault_ = f;
+      return false;
+    }
+    return true;
+  }
+
+private:
+  Host &host_;
+  Fault fault_ = Fault::none;
+  std::array<char, kChunk + kEscapeSlack> buffer_;
+  char *w_ = buffer_.data();
+
+  size_t room() const { return kChunk - std::min((size_t)(w_ - buffer_.data()), kChunk); }
+};
+
+template <fixed_string Src, class... Partials, class Host, class T>
+[[nodiscard]] Fault
+render(Host &host, const T &data)
 {
+  Chunked<Host> out(host);
   bool pending = false;
   Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(out, pending,
                                                                                                            data);
+  if (out.fault() == Fault::none) [[likely]] out.written(true);
+  return out.fault();
 }
 
 }
@@ -446,7 +509,9 @@ static_length()
   for (size_t capacity = 4096;; capacity *= 2) {
     char *buffer = new char[capacity + kSlack];
     Out out{buffer, buffer + capacity};
-    render<Src, Partials...>(out, Make());
+    bool pending = false;
+    Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(out, pending,
+                                                                                                             Make());
     const size_t n = (size_t)(out.w - buffer);
     const bool full = out.full;
     delete[] buffer;
@@ -461,7 +526,9 @@ static_page()
   constexpr size_t n = static_length<Src, Make, Partials...>();
   std::array<char, n + kSlack> page{};
   Out out{page.data(), page.data() + n};
-  render<Src, Partials...>(out, Make());
+  bool pending = false;
+  Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(out, pending,
+                                                                                                           Make());
   return page;
 }
 
