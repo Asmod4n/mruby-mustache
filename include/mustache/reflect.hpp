@@ -349,8 +349,8 @@ struct Renderer {
   static constexpr void run(W &out, bool &pending, const Ctx &...ctx)
   {
     if constexpr (pc < stop) {
-      if constexpr (requires { out.fault(); }) {
-        if (out.fault() != Fault::none) [[unlikely]] return;
+      if constexpr (requires { out.fault; }) {
+        if (out.fault != Fault::none) [[unlikely]] return;
       }
       constexpr Op op = P.ops.at(pc);
       if constexpr (op.tag == Tag::text) {
@@ -432,70 +432,16 @@ struct Renderer {
   }
 };
 
-template <class Host>
-class Chunked {
-public:
-  explicit Chunked(Host &host) : host_(host) {}
-
-  Fault fault() const { return fault_; }
-
-  void raw(const std::string_view s)
-  {
-    if (s.size() > room()) [[unlikely]] {
-      if (!written(false)) return;
-      if (s.size() > kChunk) {
-        const Fault f = write(host_, s, false);
-        if (f != Fault::none) [[unlikely]] fault_ = f;
-        return;
-      }
-    }
-    w_ = std::copy_n(s.begin(), s.size(), w_);
-  }
-
-  void escaped(const std::string_view s)
-  {
-    std::string_view rest = s;
-    while (!rest.empty()) {
-      const size_t take = std::min(rest.size(), room() / kEntityMax);
-      if (take == 0) [[unlikely]] {
-        if (!written(false)) return;
-        continue;
-      }
-      w_ = escaped_into(w_, rest.substr(0, take));
-      rest.remove_prefix(take);
-    }
-  }
-
-  bool written(const bool last)
-  {
-    const Fault f = write(host_, std::string_view(buffer_.data(), (size_t)(w_ - buffer_.data())), last);
-    w_ = buffer_.data();
-    if (f != Fault::none) [[unlikely]] {
-      fault_ = f;
-      return false;
-    }
-    return true;
-  }
-
-private:
-  Host &host_;
-  Fault fault_ = Fault::none;
-  std::array<char, kChunk + kEscapeSlack> buffer_;
-  char *w_ = buffer_.data();
-
-  size_t room() const { return kChunk - std::min((size_t)(w_ - buffer_.data()), kChunk); }
-};
-
 template <fixed_string Src, class... Partials, class Host, class T>
 [[nodiscard]] Fault
-render(Host &host, const T &data)
+render(Host &host, Buffer &buffer, const T &data)
 {
-  Chunked<Host> out(host);
+  buffer.clear();
   bool pending = false;
-  Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(out, pending,
-                                                                                                           data);
-  if (out.fault() == Fault::none) [[likely]] out.written(true);
-  return out.fault();
+  Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(
+      buffer, pending, data);
+  if (buffer.fault != Fault::none) [[unlikely]] return buffer.fault;
+  return write(host, buffer.view(), true);
 }
 
 }

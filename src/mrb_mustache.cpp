@@ -60,6 +60,7 @@ struct MrubyHost {
 struct Template {
   mustache::Program<mrb_sym> program;
   size_t                     score_max;
+  mustache::Buffer           buffer;
 };
 
 MRB_CPP_DEFINE_TYPE(Template, mustache_template)
@@ -88,7 +89,7 @@ tag_invoke(key_of_tag, MrubyHost &h, const std::string_view name)
 inline Fault
 tag_invoke(write_tag, MrubyHost &h, const std::string_view bytes, const bool)
 {
-  mrb_str_cat(h.mrb, h.answer, bytes.data(), bytes.size());
+  h.answer = mrb_str_new(h.mrb, bytes.data(), (mrb_int)bytes.size());
   return Fault::none;
 }
 
@@ -336,7 +337,7 @@ template_initialize(mrb_state *mrb, mrb_value self)
   if (!program) [[unlikely]] return self;
   if (DATA_PTR(self) != nullptr) mrb_cpp_delete(mrb, static_cast<Template *>(DATA_PTR(self)));
   DATA_PTR(self) = nullptr;
-  mrb_cpp_new<Template>(mrb, self, std::move(*program), score_max);
+  mrb_cpp_new<Template>(mrb, self, std::move(*program), score_max, mustache::Buffer{.max_capacity = kStringMax});
   mrb_iv_set(mrb, self, MRB_SYM(symbol_keys), host.symbol_keys);
   return self;
 }
@@ -358,10 +359,20 @@ template_render(mrb_state *mrb, mrb_value self)
   }
   Template *const t = mrb_cpp_get<Template>(mrb, self);
   if (t == nullptr) mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
-  MrubyHost host{mrb, partials, mrb_nil_value(), mrb_str_new(mrb, nullptr, 0), {}};
-  mustache::Walk<MrubyHost, mrb_value, mrb_sym, MUSTACHE_MAX_DEPTH, MUSTACHE_MAX_PARTIAL_DEPTH> walk(host, t->score_max);
+  MrubyHost host{mrb, partials, mrb_nil_value(), mrb_nil_value(), {}};
+  mustache::Walk<MrubyHost, mrb_value, mrb_sym, MUSTACHE_MAX_DEPTH, MUSTACHE_MAX_PARTIAL_DEPTH> walk(host, t->buffer,
+                                                                                                     t->score_max);
   walk.run(t->program, ctx);
   return host.answer;
+}
+
+mrb_value
+template_shrink_to_fit(mrb_state *mrb, mrb_value self)
+{
+  Template *const t = mrb_cpp_get<Template>(mrb, self);
+  if (t == nullptr) mrb_raise(mrb, error_class(mrb, MRB_SYM(RenderError)), "uninitialized Mustache::Template");
+  t->buffer.shrink_to_fit();
+  return self;
 }
 
 } // namespace
@@ -388,6 +399,7 @@ mrb_mruby_mustache_gem_init(mrb_state *mrb)
   mrb_define_method_id(mrb, tmpl, MRB_SYM(initialize), template_initialize, MRB_ARGS_ARG(1, 2));
   mrb_define_class_method_id(mrb, tmpl, MRB_SYM(compile), template_compile, MRB_ARGS_ARG(1, 2));
   mrb_define_method_id(mrb, tmpl, MRB_SYM(render), template_render, MRB_ARGS_OPT(2));
+  mrb_define_method_id(mrb, tmpl, MRB_SYM(shrink_to_fit), template_shrink_to_fit, MRB_ARGS_NONE());
 }
 
 extern "C" void

@@ -42,12 +42,13 @@ LLVMFuzzerTestOneInput(const uint8_t *const data, const size_t size)
   const Value root{m};
   const Value *const rp = &root;
 
-  Walk<Host, const Value *, Key, 8, 8> walk(host);
+  Buffer buffer;
+  Walk<Host, const Value *, Key, 8, 8> walk(host, buffer);
   walk.run(*program, rp);
 
   for (const size_t score : {size_t{1}, size_t{7}, size_t{64}, size_t{1} << 12}) {
     host.answer.clear();
-    Walk<Host, const Value *, Key, 6, 6> scored(host, score);
+    Walk<Host, const Value *, Key, 6, 6> scored(host, buffer, score);
     scored.run(*program, rp);
   }
   return 0;

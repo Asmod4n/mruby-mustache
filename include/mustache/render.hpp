@@ -4,6 +4,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
 #include <new>
 #include <optional>
 #include <span>
@@ -87,6 +89,72 @@ within_limit(Host &host, const std::string_view what, const size_t asked, const 
   return true;
 }
 
+inline constexpr size_t kInitialCapacity = 1024;
+
+struct Buffer {
+  std::unique_ptr<char[]> data;
+  size_t                  size = 0;
+  size_t                  capacity = 0;
+  size_t                  initial_capacity = kInitialCapacity;
+  size_t                  max_capacity = (size_t)std::numeric_limits<std::ptrdiff_t>::max() - kEscapeSlack;
+  Fault                   fault = Fault::none;
+  size_t                  asked = 0;
+  size_t                  allowed = 0;
+
+  std::string_view view() const { return {data.get(), size}; }
+
+  void clear()
+  {
+    size = 0;
+    fault = Fault::none;
+  }
+
+  bool reserved(const size_t needed)
+  {
+    if (needed <= capacity) [[likely]] return true;
+    if (fault != Fault::none) [[unlikely]] return false;
+    if (!within_limit(*this, "render output", needed, max_capacity)) [[unlikely]] return false;
+    const size_t grown = std::min(std::max({capacity * 2, needed, initial_capacity}), max_capacity);
+    std::optional<std::unique_ptr<char[]>> fresh = allocated_or_failed(
+        *this, "render output", grown, [grown] { return std::make_unique_for_overwrite<char[]>(grown + kEscapeSlack); });
+    if (!fresh) [[unlikely]] return false;
+    std::copy_n(data.get(), size, fresh->get());
+    data = std::move(*fresh);
+    capacity = grown;
+    return true;
+  }
+
+  void raw(const std::string_view s)
+  {
+    if (!reserved(size + s.size())) [[unlikely]] return;
+    std::copy_n(s.begin(), s.size(), data.get() + size);
+    size += s.size();
+  }
+
+  void escaped(const std::string_view s)
+  {
+    if (!escaped_fits(s, capacity - size) && !reserved(size + escaped_size_of(s))) [[unlikely]] return;
+    size = (size_t)(escaped_into(data.get() + size, s) - data.get());
+  }
+
+  void shrink_to_fit()
+  {
+    data.reset();
+    size = 0;
+    capacity = 0;
+    fault = Fault::none;
+    reserved(initial_capacity);
+  }
+};
+
+inline void
+tag_invoke(fail_tag, Buffer &b, const Fault fault, const std::string_view, const size_t asked, const size_t allowed)
+{
+  b.fault = fault;
+  b.asked = asked;
+  b.allowed = allowed;
+}
+
 template <class Key, class Host>
 std::optional<Program<Key>>
 program_of(Host &host, const std::string_view source, const size_t source_max)
@@ -112,12 +180,14 @@ program_of(Host &host, const std::string_view source, const size_t source_max)
 inline constexpr int kMaxDepth = 32;
 inline constexpr int kMaxPartialDepth = 64;
 inline constexpr size_t kMaxRenderScore = size_t{1} << 24;
-inline constexpr size_t kChunk = 4096;
 
 template <class Host, class Value, class Key, int kDepthMax = kMaxDepth, int kPartialDepthMax = kMaxPartialDepth>
 class Walk {
 public:
-  Walk(Host &host, const size_t score_max = kMaxRenderScore) : host_(host), score_max_(score_max) {}
+  Walk(Host &host, Buffer &buffer, const size_t score_max = kMaxRenderScore)
+      : host_(host), buffer_(buffer), score_max_(score_max)
+  {
+  }
 
   Fault run(const Program<Key> &p, const Value &root)
   {
@@ -125,9 +195,9 @@ public:
     depth_ = 1;
     score_ = 0;
     fault_ = Fault::none;
-    w_ = buffer_.data();
+    buffer_.clear();
     run(p, 0, (uint32_t)p.ops.size(), 0, nullptr, nullptr);
-    if (fault_ == Fault::none) [[likely]] written(true);
+    if (fault_ == Fault::none) [[likely]] fault_ = write(host_, buffer_.view(), true);
     switch (fault_) {
       case Fault::not_text:
         fail(host_, fault_, std::string_view("a value is not text"), size_t{0}, size_t{0});
@@ -137,6 +207,11 @@ public:
         break;
       case Fault::over_work:
         fail(host_, fault_, std::string_view("the render does more work than max_render_score"), score_, score_max_);
+        break;
+      case Fault::over_limit:
+      case Fault::no_memory:
+        if (buffer_.fault != Fault::none)
+          fail(host_, fault_, std::string_view("render output"), buffer_.asked, buffer_.allowed);
         break;
       default:
         break;
@@ -158,52 +233,23 @@ private:
   };
 
   Host &host_;
+  Buffer &buffer_;
   std::array<Value, kDepthMax> stack_{};
   int   depth_ = 0;
   size_t score_ = 0;
   size_t score_max_;
   Fault fault_ = Fault::none;
-  char *w_ = nullptr;
-  std::array<char, kChunk + kEscapeSlack> buffer_;
-
-  size_t room() const { return kChunk - std::min((size_t)(w_ - buffer_.data()), kChunk); }
-
-  bool written(const bool last)
-  {
-    const Fault f = write(host_, std::string_view(buffer_.data(), (size_t)(w_ - buffer_.data())), last);
-    w_ = buffer_.data();
-    if (f != Fault::none) [[unlikely]] {
-      fault_ = f;
-      return false;
-    }
-    return true;
-  }
 
   void raw(const std::string_view s)
   {
-    if (s.size() > room()) [[unlikely]] {
-      if (!written(false)) return;
-      if (s.size() > kChunk) {
-        const Fault f = write(host_, s, false);
-        if (f != Fault::none) [[unlikely]] fault_ = f;
-        return;
-      }
-    }
-    w_ = std::copy_n(s.begin(), s.size(), w_);
+    buffer_.raw(s);
+    if (buffer_.fault != Fault::none) [[unlikely]] fault_ = buffer_.fault;
   }
 
   void escaped(const std::string_view s)
   {
-    std::string_view rest = s;
-    while (!rest.empty()) {
-      const size_t take = std::min(rest.size(), room() / kEntityMax);
-      if (take == 0) [[unlikely]] {
-        if (!written(false)) return;
-        continue;
-      }
-      w_ = escaped_into(w_, rest.substr(0, take));
-      rest.remove_prefix(take);
-    }
+    buffer_.escaped(s);
+    if (buffer_.fault != Fault::none) [[unlikely]] fault_ = buffer_.fault;
   }
 
   void indent_of(const Indent *const ind)

@@ -8,11 +8,10 @@ assert('a render that raises leaves the template whole') do
   assert_equal 'xy', t.render({ rows: [{ a: 'x' }, { a: 'y' }] })
 end
 
-# A render fills a buffer of 4096 bytes and hands each full buffer to the
-# host. A value that does not fit starts the next buffer, an escaped value
-# is split between two buffers, and a raw value longer than one buffer is
-# handed over as it is. Every length around 4096 has to come back whole.
-assert('an answer that crosses a buffer boundary comes back whole') do
+# A render writes into one buffer that starts at 1024 bytes and doubles.
+# A value that does not fit makes the buffer grow before the copy. Every
+# length around a doubled capacity has to come back whole.
+assert('an answer that makes the buffer grow comes back whole') do
   t = Mustache::Template.new('{{{a}}}{{b}}{{{c}}}')
   [4000, 4090, 4095, 4096, 4097, 8191, 8192, 8193, 20_000].each do |n|
     a = 'x' * n
@@ -22,13 +21,60 @@ assert('an answer that crosses a buffer boundary comes back whole') do
   end
 end
 
-# An escaped value grows up to six times. The part of it that fits in the
-# rest of a buffer is escaped there, and the rest goes to the next buffer.
-assert('an escaped value is split at a buffer boundary without a loss') do
+# An escaped value grows up to six times. The buffer grows to the exact
+# escaped size before the escape, so the escape never writes past the end.
+# The lengths put the end of the escape near a doubled capacity.
+assert('an escaped value near the end of the buffer comes back whole') do
   t = Mustache::Template.new('{{{a}}}{{b}}')
   (4080..4100).each do |n|
     assert_equal ('x' * n) + '&quot;' * 700, t.render({ a: 'x' * n, b: '"' * 700 })
   end
+end
+
+# The template keeps its buffer from one render to the next. A result is
+# a new String, so a result that the caller holds must not change when
+# the next render writes over the buffer.
+assert('a result stays unchanged after the next render') do
+  t = Mustache::Template.new('{{a}}')
+  first = t.render({ a: 'x' * 100 })
+  second = t.render({ a: 'y' * 100 })
+  assert_equal 'x' * 100, first
+  assert_equal 'y' * 100, second
+end
+
+# The buffer grows for a large answer and does not shrink by itself. A
+# small answer after a large one must carry only its own bytes, and each
+# earlier result must keep its bytes through the growth.
+assert('results stay whole across buffer growth') do
+  t = Mustache::Template.new('{{{a}}}')
+  sizes = [10, 5 * 1024, 200 * 1024, 10]
+  results = sizes.each_with_index.map { |n, i| t.render({ a: ('a'.ord + i).chr * n }) }
+  sizes.each_with_index do |n, i|
+    assert_equal ('a'.ord + i).chr * n, results[i]
+  end
+end
+
+# shrink_to_fit gives the memory of a grown buffer back. The next render
+# has to grow the buffer again and still give the whole answer.
+assert('a render after shrink_to_fit comes back whole') do
+  t = Mustache::Template.new('{{{a}}}')
+  big = t.render({ a: 'b' * (64 * 1024) })
+  assert_equal t, t.shrink_to_fit
+  assert_equal 'b' * (64 * 1024), big
+  assert_equal 'c' * (64 * 1024), t.render({ a: 'c' * (64 * 1024) })
+  assert_equal 'd', t.shrink_to_fit.render({ a: 'd' })
+end
+
+# mruby keeps a String up to RSTRING_EMBED_LEN_MAX bytes inside the
+# object and a longer one on the heap. The result is copied out of the
+# buffer in both forms. The lengths 1 and 200 lie on the two sides of
+# that limit on every word size.
+assert('a short and a long result both come back whole') do
+  t = Mustache::Template.new('{{{a}}}')
+  short = t.render({ a: 's' })
+  long = t.render({ a: 'l' * 200 })
+  assert_equal 's', short
+  assert_equal 'l' * 200, long
 end
 
 assert('a size cannot be negative') do
