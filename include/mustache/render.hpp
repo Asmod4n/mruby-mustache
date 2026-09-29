@@ -45,7 +45,9 @@ MUSTACHE_TAG(size_of)
 MUSTACHE_TAG(element)
 MUSTACHE_TAG(partial)
 MUSTACHE_TAG(fail)
-MUSTACHE_TAG(write)
+MUSTACHE_TAG(new_string)
+MUSTACHE_TAG(grow)
+MUSTACHE_TAG(done)
 
 #undef MUSTACHE_TAG
 
@@ -91,69 +93,66 @@ within_limit(Host &host, const std::string_view what, const size_t asked, const 
 
 inline constexpr size_t kInitialCapacity = 1024;
 
-struct Buffer {
-  std::unique_ptr<char[]> data;
-  size_t                  size = 0;
-  size_t                  capacity = 0;
-  size_t                  initial_capacity = kInitialCapacity;
-  size_t                  max_capacity = (size_t)std::numeric_limits<std::ptrdiff_t>::max() - kEscapeSlack;
-  Fault                   fault = Fault::none;
-  size_t                  asked = 0;
-  size_t                  allowed = 0;
+inline constexpr size_t kMaxCapacity = (size_t)std::numeric_limits<std::ptrdiff_t>::max() - kEscapeSlack;
 
-  std::string_view view() const { return {data.get(), size}; }
+template <class Host>
+struct HostString {
+  Host           &host;
+  std::span<char> bytes;
+  size_t          size = 0;
+  size_t          max_capacity = kMaxCapacity;
+  Fault           fault = Fault::none;
+  size_t          asked = 0;
+  size_t          allowed = 0;
 
-  void clear()
+  size_t capacity() const { return bytes.size() - kEscapeSlack; }
+
+  bool opened(const size_t initial_capacity)
   {
-    size = 0;
-    fault = Fault::none;
+    bytes = new_string(host, initial_capacity + kEscapeSlack);
+    if (bytes.size() < initial_capacity + kEscapeSlack) [[unlikely]] {
+      bytes = {};
+      fault = Fault::no_memory;
+      asked = initial_capacity;
+      return false;
+    }
+    return true;
   }
 
-  bool reserved(const size_t needed)
+  bool grown(const size_t needed)
   {
-    if (needed <= capacity) [[likely]] return true;
     if (fault != Fault::none) [[unlikely]] return false;
-    if (!within_limit(*this, "render output", needed, max_capacity)) [[unlikely]] return false;
-    const size_t grown = std::min(std::max({capacity * 2, needed, initial_capacity}), max_capacity);
-    std::optional<std::unique_ptr<char[]>> fresh = allocated_or_failed(
-        *this, "render output", grown, [grown] { return std::make_unique_for_overwrite<char[]>(grown + kEscapeSlack); });
-    if (!fresh) [[unlikely]] return false;
-    std::copy_n(data.get(), size, fresh->get());
-    data = std::move(*fresh);
-    capacity = grown;
+    if (needed > max_capacity) [[unlikely]] {
+      fault = Fault::over_limit;
+      asked = needed;
+      allowed = max_capacity;
+      return false;
+    }
+    const size_t target = std::min(std::max(capacity() * 2, needed), max_capacity);
+    const std::span<char> fresh = grow(host, size, target + kEscapeSlack);
+    if (fresh.size() < target + kEscapeSlack) [[unlikely]] {
+      fault = Fault::no_memory;
+      asked = target;
+      return false;
+    }
+    bytes = fresh;
     return true;
   }
 
   void raw(const std::string_view s)
   {
-    if (!reserved(size + s.size())) [[unlikely]] return;
-    std::copy_n(s.begin(), s.size(), data.get() + size);
+    if (size + s.size() > capacity() && !grown(size + s.size())) [[unlikely]] return;
+    std::ranges::copy(s, bytes.subspan(size).begin());
     size += s.size();
   }
 
   void escaped(const std::string_view s)
   {
-    if (!escaped_fits(s, capacity - size) && !reserved(size + escaped_size_of(s))) [[unlikely]] return;
-    size = (size_t)(escaped_into(data.get() + size, s) - data.get());
-  }
-
-  void shrink_to_fit()
-  {
-    data.reset();
-    size = 0;
-    capacity = 0;
-    fault = Fault::none;
-    reserved(initial_capacity);
+    if (!escaped_fits(s, capacity() - size) && !grown(size + escaped_size_of(s))) [[unlikely]] return;
+    char *const w = bytes.subspan(size).data();
+    size += (size_t)std::distance(w, escaped_into(w, s));
   }
 };
-
-inline void
-tag_invoke(fail_tag, Buffer &b, const Fault fault, const std::string_view, const size_t asked, const size_t allowed)
-{
-  b.fault = fault;
-  b.asked = asked;
-  b.allowed = allowed;
-}
 
 template <class Key, class Host>
 std::optional<Program<Key>>
@@ -184,8 +183,9 @@ inline constexpr size_t kMaxRenderScore = size_t{1} << 24;
 template <class Host, class Value, class Key, int kDepthMax = kMaxDepth, int kPartialDepthMax = kMaxPartialDepth>
 class Walk {
 public:
-  Walk(Host &host, Buffer &buffer, const size_t score_max = kMaxRenderScore)
-      : host_(host), buffer_(buffer), score_max_(score_max)
+  Walk(Host &host, const size_t score_max = kMaxRenderScore, const size_t initial_capacity = kInitialCapacity,
+       const size_t max_capacity = kMaxCapacity)
+      : host_(host), out_{host, {}, 0, max_capacity}, score_max_(score_max), initial_capacity_(initial_capacity)
   {
   }
 
@@ -195,10 +195,20 @@ public:
     depth_ = 1;
     score_ = 0;
     fault_ = Fault::none;
-    buffer_.clear();
+    out_.size = 0;
+    out_.fault = Fault::none;
+    if (!out_.opened(initial_capacity_)) [[unlikely]] return failed(out_.fault);
     run(p, 0, (uint32_t)p.ops.size(), 0, nullptr, nullptr);
-    if (fault_ == Fault::none) [[likely]] fault_ = write(host_, buffer_.view(), true);
-    switch (fault_) {
+    const Fault closed = done(host_, out_.size);
+    if (fault_ != Fault::none) [[unlikely]] return failed(fault_);
+    if (closed != Fault::none) [[unlikely]] return failed(closed);
+    return Fault::none;
+  }
+
+private:
+  Fault failed(const Fault fault)
+  {
+    switch (fault) {
       case Fault::not_text: [[unlikely]]
         fail(host_, fault_, std::string_view("a value is not text"), size_t{0}, size_t{0});
         break;
@@ -210,16 +220,15 @@ public:
         break;
       case Fault::over_limit:
       case Fault::no_memory: [[unlikely]]
-        if (buffer_.fault != Fault::none)
-          fail(host_, fault_, std::string_view("render output"), buffer_.asked, buffer_.allowed);
+        if (out_.fault != Fault::none)
+          fail(host_, fault, std::string_view("render output"), out_.asked, out_.allowed);
         break;
       default:
         break;
     }
-    return fault_;
+    return fault;
   }
 
-private:
   struct Indent {
     const Indent    *outer;
     std::string_view text;
@@ -233,23 +242,24 @@ private:
   };
 
   Host &host_;
-  Buffer &buffer_;
+  HostString<Host> out_;
   std::array<Value, kDepthMax> stack_{};
   int   depth_ = 0;
   size_t score_ = 0;
   size_t score_max_;
+  size_t initial_capacity_;
   Fault fault_ = Fault::none;
 
   void raw(const std::string_view s)
   {
-    buffer_.raw(s);
-    if (buffer_.fault != Fault::none) [[unlikely]] fault_ = buffer_.fault;
+    out_.raw(s);
+    if (out_.fault != Fault::none) [[unlikely]] fault_ = out_.fault;
   }
 
   void escaped(const std::string_view s)
   {
-    buffer_.escaped(s);
-    if (buffer_.fault != Fault::none) [[unlikely]] fault_ = buffer_.fault;
+    out_.escaped(s);
+    if (out_.fault != Fault::none) [[unlikely]] fault_ = out_.fault;
   }
 
   void indent_of(const Indent *const ind)
@@ -261,9 +271,10 @@ private:
 
   void indent_if_pending(Indent *const ind)
   {
-    if (ind == nullptr || !ind->pending) [[likely]] return;
-    ind->pending = false;
-    indent_of(ind);
+    if (ind != nullptr && ind->pending) [[unlikely]] {
+      ind->pending = false;
+      indent_of(ind);
+    }
   }
 
   void text(const std::string_view all, Indent *const ind)

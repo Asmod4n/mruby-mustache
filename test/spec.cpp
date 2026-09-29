@@ -97,8 +97,7 @@ renders_as_expected(const Case &c)
   h.partials = &partials;
   const std::optional<Program> p = mustache::program_of<Key>(h, c.source, mustache::kSourceMax);
   if (!p) return false;
-  mustache::Buffer buffer;
-  const mustache::Fault f = mustache::Walk<Host, const Value *, Key>(h, buffer).run(*p, &c.data);
+  const mustache::Fault f = mustache::Walk<Host, const Value *, Key>(h).run(*p, &c.data);
   return f == mustache::Fault::none && h.answer == c.expected;
 }
 

@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -57,10 +58,29 @@ struct Host {
   std::array<char, 32> text{};
 };
 
-inline Fault
-tag_invoke(write_tag, Host &h, const std::string_view bytes, const bool)
+inline std::span<char>
+tag_invoke(new_string_tag, Host &h, const size_t capacity)
 {
-  h.answer.append(bytes);
+  h.answer = std::string();
+  return allocated_or_failed(h, "render output", capacity, [&h, capacity] {
+           h.answer.resize(capacity);
+           return std::span<char>(h.answer);
+         }).value_or(std::span<char>());
+}
+
+inline std::span<char>
+tag_invoke(grow_tag, Host &h, const size_t, const size_t capacity)
+{
+  return allocated_or_failed(h, "render output", capacity, [&h, capacity] {
+           h.answer.resize(capacity);
+           return std::span<char>(h.answer);
+         }).value_or(std::span<char>());
+}
+
+inline Fault
+tag_invoke(done_tag, Host &h, const size_t size)
+{
+  h.answer.resize(size);
   return Fault::none;
 }
 

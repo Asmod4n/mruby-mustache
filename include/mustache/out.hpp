@@ -25,8 +25,8 @@ escaped_size_of(const std::string_view s)
 constexpr bool
 escaped_fits(const std::string_view s, const size_t room)
 {
-  if (s.size() <= room / kEntityMax) [[likely]] return true;
-  return escaped_size_of(s) <= room;
+  if (s.size() > room / kEntityMax) [[unlikely]] return escaped_size_of(s) <= room;
+  return true;
 }
 
 constexpr char *

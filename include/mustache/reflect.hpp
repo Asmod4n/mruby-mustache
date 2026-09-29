@@ -466,15 +466,17 @@ struct Renderer {
 
 template <fixed_string Src, class... Partials, class Host, class T>
 [[nodiscard]] Fault
-render(Host &host, Buffer &buffer, const T &data)
+render(Host &host, const T &data, const size_t initial_capacity = kInitialCapacity)
 {
   if constexpr (static_program_of<Src>.refused) detail::does_not_compile<Src>();
-  buffer.clear();
+  HostString<Host> out{host, {}};
+  if (!out.opened(initial_capacity)) [[unlikely]] return out.fault;
   bool pending = false;
   Renderer<Src, static_partial_list<Partials...>>::template run<0, (uint32_t)static_program_of<Src>.ops.size()>(
-      buffer, pending, data);
-  if (buffer.fault != Fault::none) [[unlikely]] return buffer.fault;
-  return write(host, buffer.view(), true);
+      out, pending, data);
+  const Fault closed = done(host, out.size);
+  if (out.fault != Fault::none) [[unlikely]] return out.fault;
+  return closed;
 }
 
 }
