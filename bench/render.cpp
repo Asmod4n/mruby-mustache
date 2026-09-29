@@ -1,7 +1,6 @@
 #include <mustache-c/mustache.h>
 #include <mustache/reflect.hpp>
 #include <mustache/std.hpp>
-#include <mustache/steps.hpp>
 
 #include <benchmark/benchmark.h>
 
@@ -12,10 +11,9 @@
 #include <vector>
 
 // One binary answers one question for one workload: how long a render
-// takes through the C++ Walk with its tags, through Steps driven in
-// C++, through the C API that drives Steps by requests, and, where the
-// compiler has reflection, through the reflection render as the
-// reference. The build picks the workload with -DWORKLOAD=1, 2 or 3.
+// takes through the C++ Walk with its tags, through the C API with its
+// callbacks, and, where the compiler has reflection, through the
+// reflection render as the reference. The build picks the workload with -DWORKLOAD=1, 2 or 3.
 //
 // Every arm renders into a fresh std::string per render and asks for
 // the size of the last output as its first capacity, so every arm pays
@@ -257,82 +255,104 @@ rendered_by_walk(Host &h, const size_t capacity)
   return std::move(h.answer);
 }
 
-std::string
-rendered_by_steps(mustache::Steps<const Value *, Key> &steps, Host &h, const size_t capacity)
-{
+// The callbacks of the C API read the same std_host values. The string
+// is a std::string, grown the way std_host grows it.
+struct CUser {
+  Host        host;
   std::string answer;
-  steps.initial_capacity = capacity;
-  steps.start(kProgram, &kRoot);
-  for (;;) {
-    const mustache::Ask<const Value *> ask = steps.next();
-    switch (ask.request) {
-      case mustache::Request::find: {
-        const Map *const map = std::get_if<Map>(&ask.value->v);
-        const auto found = map == nullptr ? Map::const_iterator() : map->find(ask.text);
-        steps.found(map == nullptr || found == map->end() ? std::nullopt
-                                                          : std::optional<const Value *>(&found->second));
-        break;
-      }
-      case mustache::Request::kind:    steps.kind_is(mustache::kind_of(h, ask.value)); break;
-      case mustache::Request::text:    steps.text_is(mustache::text_of(h, ask.value)); break;
-      case mustache::Request::size:    steps.size_is(mustache::size_of(h, ask.value)); break;
-      case mustache::Request::element: steps.found(mustache::element(h, ask.value, ask.size)); break;
-      case mustache::Request::partial: steps.partial_is(nullptr); break;
-      case mustache::Request::new_string:
-        answer = std::string();
-        [[fallthrough]];
-      case mustache::Request::grow:
-        answer.resize(ask.capacity);
-        steps.string_is(answer);
-        break;
-      case mustache::Request::done:     answer.resize(ask.size); break;
-      case mustache::Request::finished: return answer;
-      case mustache::Request::failed:   std::abort();
-    }
-  }
+};
+
+const void *
+c_find(void *, const void *const v, const char *const key, const size_t size)
+{
+  const Map *const map = std::get_if<Map>(&static_cast<const Value *>(v)->v);
+  if (map == nullptr) return nullptr;
+  const auto found = map->find(std::string_view(key, size));
+  return found == map->end() ? nullptr : &found->second;
+}
+
+int
+c_kind(void *const user, const void *const v)
+{
+  return (int)mustache::kind_of(static_cast<CUser *>(user)->host, static_cast<const Value *>(v));
+}
+
+const char *
+c_text(void *const user, const void *const v, size_t *const size)
+{
+  const std::string_view text = mustache::text_of(static_cast<CUser *>(user)->host, static_cast<const Value *>(v));
+  *size = text.size();
+  return text.data();
+}
+
+size_t
+c_size(void *const user, const void *const v)
+{
+  return mustache::size_of(static_cast<CUser *>(user)->host, static_cast<const Value *>(v));
+}
+
+const void *
+c_element(void *const user, const void *const v, const size_t i)
+{
+  return mustache::element(static_cast<CUser *>(user)->host, static_cast<const Value *>(v), i);
+}
+
+const mustache_template *
+c_partial(void *, const char *, size_t)
+{
+  return nullptr;
+}
+
+char *
+c_new_string(void *const user, const size_t capacity, void **const string, size_t *const real_capacity)
+{
+  std::string &answer = static_cast<CUser *>(user)->answer;
+  answer = std::string();
+  answer.resize(capacity);
+  *string = &answer;
+  *real_capacity = answer.size();
+  return answer.data();
+}
+
+char *
+c_grow(void *, void **const string, const size_t, const size_t capacity, size_t *const real_capacity)
+{
+  std::string &answer = *static_cast<std::string *>(*string);
+  answer.resize(capacity);
+  *real_capacity = answer.size();
+  return answer.data();
+}
+
+int
+c_done(void *, void *const string, const size_t size)
+{
+  static_cast<std::string *>(string)->resize(size);
+  return 0;
+}
+
+mustache_template *
+compiled_for_c()
+{
+  mustache_template *tpl = nullptr;
+  if (mustache_compile(kSource.data(), kSource.size(), &tpl) != 0) std::abort();
+  mustache_set_find(tpl, c_find);
+  mustache_set_kind(tpl, c_kind);
+  mustache_set_text(tpl, c_text);
+  mustache_set_size(tpl, c_size);
+  mustache_set_element(tpl, c_element);
+  mustache_set_partial(tpl, c_partial);
+  mustache_set_new_string(tpl, c_new_string);
+  mustache_set_grow(tpl, c_grow);
+  mustache_set_done(tpl, c_done);
+  return tpl;
 }
 
 std::string
-rendered_by_c_api(mustache_template *const tpl, Host &h)
+rendered_by_c_api(mustache_template *const tpl, CUser &user)
 {
-  std::string answer;
-  if (mustache_render(tpl, &kRoot) != 0) std::abort();
-  for (;;) {
-    const void *value = nullptr;
-    const char *text = nullptr;
-    size_t size = 0;
-    size_t capacity = 0;
-    const int r = mustache_next(tpl, &value, &text, &size, &capacity);
-    const Value *const v = static_cast<const Value *>(value);
-    switch (r) {
-      case MUSTACHE_RENDER:
-        return answer;
-      case MUSTACHE_FIND: {
-        const Map *const map = std::get_if<Map>(&v->v);
-        const auto found = map == nullptr ? Map::const_iterator() : map->find(std::string_view(text, size));
-        mustache_answer(tpl, map == nullptr || found == map->end() ? nullptr : &found->second, nullptr, 0);
-        break;
-      }
-      case MUSTACHE_KIND: mustache_answer(tpl, nullptr, nullptr, (size_t)mustache::kind_of(h, v)); break;
-      case MUSTACHE_TEXT: {
-        const std::string_view s = mustache::text_of(h, v);
-        mustache_answer(tpl, nullptr, s.data(), s.size());
-        break;
-      }
-      case MUSTACHE_SIZE:    mustache_answer(tpl, nullptr, nullptr, mustache::size_of(h, v)); break;
-      case MUSTACHE_ELEMENT: mustache_answer(tpl, mustache::element(h, v, size), nullptr, 0); break;
-      case MUSTACHE_PARTIAL: mustache_answer(tpl, nullptr, nullptr, 0); break;
-      case MUSTACHE_NEW_STRING:
-        answer = std::string();
-        [[fallthrough]];
-      case MUSTACHE_GROW:
-        answer.resize(capacity);
-        mustache_answer_string(tpl, answer.data(), answer.size());
-        break;
-      case MUSTACHE_DONE: answer.resize(size); break;
-      default:            std::abort();
-    }
-  }
+  void *string = nullptr;
+  if (mustache_render(tpl, &kRoot, nullptr, &user, &string) != 0) std::abort();
+  return std::move(user.answer);
 }
 
 #ifdef __cpp_impl_reflection
@@ -358,27 +378,12 @@ walk(benchmark::State &state)
 }
 
 void
-steps(benchmark::State &state)
-{
-  Host h;
-  mustache::Steps<const Value *, Key> machine;
-  size_t last = mustache::kInitialCapacity;
-  for (auto _ : state) {
-    std::string answer = rendered_by_steps(machine, h, last);
-    last = answer.size();
-    benchmark::DoNotOptimize(answer.data());
-    benchmark::ClobberMemory();
-  }
-}
-
-void
 c_api(benchmark::State &state)
 {
-  Host h;
-  mustache_template *tpl = nullptr;
-  if (mustache_compile(kSource.data(), kSource.size(), &tpl) != 0) std::abort();
+  CUser user;
+  mustache_template *const tpl = compiled_for_c();
   for (auto _ : state) {
-    std::string answer = rendered_by_c_api(tpl, h);
+    std::string answer = rendered_by_c_api(tpl, user);
     benchmark::DoNotOptimize(answer.data());
     benchmark::ClobberMemory();
   }
@@ -403,7 +408,6 @@ reflection(benchmark::State &state)
 }
 
 BENCHMARK(walk);
-BENCHMARK(steps);
 BENCHMARK(c_api);
 #ifdef __cpp_impl_reflection
 BENCHMARK(reflection);
@@ -415,11 +419,9 @@ main(int argc, char **argv)
 {
   Host h;
   const std::string expected = rendered_by_walk(h, mustache::kInitialCapacity);
-  mustache::Steps<const Value *, Key> machine;
-  mustache_template *tpl = nullptr;
-  if (mustache_compile(kSource.data(), kSource.size(), &tpl) != 0) std::abort();
-  const bool same = rendered_by_steps(machine, h, mustache::kInitialCapacity) == expected &&
-                    rendered_by_c_api(tpl, h) == expected
+  mustache_template *const tpl = compiled_for_c();
+  CUser user;
+  const bool same = rendered_by_c_api(tpl, user) == expected
 #ifdef __cpp_impl_reflection
                     && rendered_by_reflection(h, mustache::kInitialCapacity) == expected
 #endif

@@ -1,6 +1,6 @@
 #include <mustache/std.hpp>
 
-#include "pull.hpp"
+#include "c_host.hpp"
 
 #include <cstdio>
 #include <string>
@@ -32,14 +32,21 @@ rendered(const std::string_view source, const Map &data, const size_t initial_ca
   return {f, h.answer};
 }
 
-// The same render through the C API. The string grows by requests
-// there, from the size of the last output of the template.
+// The same render through the C API. A template asks for the size of
+// its last output as its first capacity, so each render here uses a
+// fresh template and starts from the default, as the Walk does.
 Rendered
-rendered_through_c(mustache_template *const tpl, const Map &data)
+rendered_through_c(const std::string_view source, const Map &data)
 {
+  mustache_template *tpl = nullptr;
+  if (mustache_compile(source.data(), source.size(), &tpl) != 0) return {mustache::Fault::parse, {}};
+  c_set_callbacks(tpl);
   const Value root{data};
-  const Pulled r = pulled(tpl, root, {});
-  return {r.result == 0 && r.done_seen ? mustache::Fault::none : mustache::Fault::no_memory, r.answer};
+  CUser user;
+  void *string = nullptr;
+  const int r = mustache_render(tpl, &root, c_release, &user, &string);
+  mustache_dispose_template(tpl);
+  return {r == 0 ? mustache::Fault::none : mustache::Fault::no_memory, user.answer};
 }
 
 std::string
@@ -78,26 +85,9 @@ main()
       const Rendered r = rendered("{{{a}}}{{b}}{{{c}}}", m, initial, mustache::kMaxCapacity);
       const std::string expected = std::string(n, 'x') + repeated("&lt;&amp;", 3000) + std::string(n, 'y');
       expect(r.fault == mustache::Fault::none && r.answer == expected, "growth", n);
+      const Rendered c = rendered_through_c("{{{a}}}{{b}}{{{c}}}", m);
+      expect(c.fault == mustache::Fault::none && c.answer == expected, "growth through C", n);
     }
-  }
-
-  // The same lengths through the C API. One template renders them all,
-  // so each render starts from the size of the one before it, and a
-  // smaller answer after a larger one has to come back whole too.
-  {
-    mustache_template *tpl = nullptr;
-    const std::string_view source = "{{{a}}}{{b}}{{{c}}}";
-    mustache_compile(source.data(), source.size(), &tpl);
-    for (const size_t n : {4000, 20000, 4090, 4095, 4096, 4097, 8191, 8192, 8193, 10}) {
-      Map m;
-      m.insert_or_assign("a", Value{std::string(n, 'x')});
-      m.insert_or_assign("b", Value{repeated("<&", 3000)});
-      m.insert_or_assign("c", Value{std::string(n, 'y')});
-      const Rendered r = rendered_through_c(tpl, m);
-      const std::string expected = std::string(n, 'x') + repeated("&lt;&amp;", 3000) + std::string(n, 'y');
-      expect(r.fault == mustache::Fault::none && r.answer == expected, "growth through C", n);
-    }
-    mustache_dispose_template(tpl);
   }
 
   // An escaped value grows up to six times. The string grows to the
@@ -111,11 +101,7 @@ main()
     const Rendered r = rendered("{{{a}}}{{b}}", m, mustache::kInitialCapacity, mustache::kMaxCapacity);
     expect(r.fault == mustache::Fault::none && r.answer == std::string(n, 'x') + repeated("&quot;", 700),
            "escape near the end", n);
-    mustache_template *tpl = nullptr;
-    const std::string_view source = "{{{a}}}{{b}}";
-    mustache_compile(source.data(), source.size(), &tpl);
-    const Rendered c = rendered_through_c(tpl, m);
-    mustache_dispose_template(tpl);
+    const Rendered c = rendered_through_c("{{{a}}}{{b}}", m);
     expect(c.fault == mustache::Fault::none && c.answer == std::string(n, 'x') + repeated("&quot;", 700),
            "escape near the end through C", n);
   }

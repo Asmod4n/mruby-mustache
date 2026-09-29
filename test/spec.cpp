@@ -1,6 +1,6 @@
 #include <mustache/std.hpp>
 
-#include "pull.hpp"
+#include "c_host.hpp"
 
 #include <simdjson.h>
 
@@ -103,8 +103,8 @@ renders_as_expected(const Case &c)
   return f == mustache::Fault::none && h.answer == c.expected;
 }
 
-// The same cases run through the C API, which asks for every value
-// with mustache_next instead of calling back.
+// The same cases run through the C API, partials included: the partial
+// callback gives the handle of a compiled partial.
 bool
 renders_as_expected_through_c(const Case &c)
 {
@@ -117,10 +117,17 @@ renders_as_expected_through_c(const Case &c)
   }
   mustache_template *tpl = nullptr;
   compiled = mustache_compile(c.source.data(), c.source.size(), &tpl) == 0 && compiled;
-  const Pulled r = compiled ? pulled(tpl, c.data, partials) : Pulled{-1, 0, {}, false};
+  CUser user;
+  user.partials = &partials;
+  void *string = nullptr;
+  int rendered = -1;
+  if (compiled) {
+    c_set_callbacks(tpl);
+    rendered = mustache_render(tpl, &c.data, c_release, &user, &string);
+  }
   mustache_dispose_template(tpl);
   for (const auto &[name, p] : partials) mustache_dispose_template(p);
-  return r.result == 0 && r.done_seen && r.answer == c.expected;
+  return rendered == 0 && string == &user && user.answer == c.expected;
 }
 
 }

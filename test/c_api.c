@@ -7,7 +7,7 @@
 
 /* This file is C, so it also shows that the header is C: a handle of an
  * incomplete type, no struct a caller must build, and every function
- * gives 0 or more, or -1 with errno. */
+ * gives 0 or a code, or -1 with errno. */
 
 struct value {
   int                 kind;
@@ -15,16 +15,117 @@ struct value {
   const struct value *child;
 };
 
-struct rendered {
-  int    result;
-  int    error;
-  int    done_seen;
-  char   answer[4096];
-  char  *string;
-  size_t capacity;
+struct user {
+  char answer[4096];
 };
 
+static const void *
+find(void *user, const void *value, const char *key, size_t size)
+{
+  const struct value *v = value;
+  (void)user;
+  if (v->kind != MUSTACHE_KIND_MAP || size != 1 || key[0] != 'a') return NULL;
+  return v->child;
+}
+
+static int
+kind(void *user, const void *value)
+{
+  (void)user;
+  return ((const struct value *)value)->kind;
+}
+
+static const char *
+text(void *user, const void *value, size_t *size)
+{
+  const struct value *v = value;
+  (void)user;
+  *size = strlen(v->text);
+  return v->text;
+}
+
+static size_t
+size_of(void *user, const void *value)
+{
+  (void)user;
+  (void)value;
+  return 1;
+}
+
+static const void *
+element(void *user, const void *value, size_t index)
+{
+  (void)user;
+  (void)index;
+  return ((const struct value *)value)->child;
+}
+
+static const mustache_template *
+partial(void *user, const char *name, size_t size)
+{
+  (void)user;
+  (void)name;
+  (void)size;
+  return NULL;
+}
+
+static char *
+new_string(void *user, size_t capacity, void **string, size_t *real_capacity)
+{
+  char *bytes = malloc(capacity);
+  (void)user;
+  *string = bytes;
+  *real_capacity = capacity;
+  return bytes;
+}
+
+static char *
+grow(void *user, void **string, size_t size, size_t capacity, size_t *real_capacity)
+{
+  char *bytes = realloc(*string, capacity);
+  (void)user;
+  (void)size;
+  if (bytes == NULL) return NULL;
+  *string = bytes;
+  *real_capacity = capacity;
+  return bytes;
+}
+
+static int
+done(void *user, void *string, size_t size)
+{
+  struct user *u = user;
+  memcpy(u->answer, string, size);
+  u->answer[size] = '\0';
+  free(string);
+  return 0;
+}
+
+/* A render owns the root it is given and releases it once, whether the
+ * render succeeds or not. The count shows that. */
+static int released = 0;
+
+static void
+release(const void *root)
+{
+  (void)root;
+  released++;
+}
+
 static int failed = 0;
+
+static mustache_template *reentered = NULL;
+static int                reentered_result = 0;
+static int                reentered_errno = 0;
+
+static int
+kind_that_renders_again(void *user, const void *value)
+{
+  void *string = NULL;
+  reentered_result = mustache_render(reentered, value, NULL, user, &string);
+  reentered_errno = errno;
+  return ((const struct value *)value)->kind;
+}
 
 static void
 expect(int ok, const char *what)
@@ -34,67 +135,21 @@ expect(int ok, const char *what)
   printf("FAIL %s\n", what);
 }
 
-/* A host answers every request with a call. It owns the string: it
- * allocates it at MUSTACHE_NEW_STRING, grows it, and frees it at
- * MUSTACHE_DONE, which comes after a failure too. */
-static struct rendered
-rendered(mustache_template *tpl, const struct value *root)
+static mustache_template *
+compiled(const char *source)
 {
-  struct rendered out;
-  memset(&out, 0, sizeof out);
-  if (mustache_render(tpl, root) != 0) {
-    out.result = -1;
-    out.error = errno;
-    return out;
-  }
-  for (;;) {
-    const void *value = NULL;
-    const char *text = NULL;
-    size_t size = 0;
-    size_t capacity = 0;
-    const struct value *v;
-    char *grown;
-    int r = mustache_next(tpl, &value, &text, &size, &capacity);
-    v = value;
-    switch (r) {
-      case MUSTACHE_RENDER:
-        return out;
-      case MUSTACHE_FIND:
-        mustache_answer(tpl, v->kind == MUSTACHE_KIND_MAP && size == 1 && text[0] == 'a' ? v->child : NULL, NULL, 0);
-        break;
-      case MUSTACHE_KIND:
-        mustache_answer(tpl, NULL, NULL, (size_t)v->kind);
-        break;
-      case MUSTACHE_TEXT:
-        mustache_answer(tpl, NULL, v->text, strlen(v->text));
-        break;
-      case MUSTACHE_SIZE:
-        mustache_answer(tpl, NULL, NULL, 1);
-        break;
-      case MUSTACHE_ELEMENT:
-        mustache_answer(tpl, v->child, NULL, 0);
-        break;
-      case MUSTACHE_PARTIAL:
-        mustache_answer(tpl, NULL, NULL, 0);
-        break;
-      case MUSTACHE_NEW_STRING:
-      case MUSTACHE_GROW:
-        grown = realloc(out.string, capacity);
-        if (grown != NULL) out.string = grown;
-        mustache_answer_string(tpl, grown, capacity);
-        break;
-      case MUSTACHE_DONE:
-        memcpy(out.answer, out.string, size < sizeof out.answer - 1 ? size : sizeof out.answer - 1);
-        free(out.string);
-        out.string = NULL;
-        out.done_seen = 1;
-        break;
-      default:
-        out.result = -1;
-        out.error = errno;
-        break;
-    }
-  }
+  mustache_template *tpl = NULL;
+  if (mustache_compile(source, strlen(source), &tpl) != 0) return tpl;
+  mustache_set_find(tpl, find);
+  mustache_set_kind(tpl, kind);
+  mustache_set_text(tpl, text);
+  mustache_set_size(tpl, size_of);
+  mustache_set_element(tpl, element);
+  mustache_set_partial(tpl, partial);
+  mustache_set_new_string(tpl, new_string);
+  mustache_set_grow(tpl, grow);
+  mustache_set_done(tpl, done);
+  return tpl;
 }
 
 static int
@@ -106,52 +161,41 @@ message_is(const mustache_template *tpl, const char *expected)
   return size == strlen(expected) && memcmp(message, expected, size) == 0;
 }
 
-static mustache_template *
-compiled(const char *source)
-{
-  mustache_template *tpl = NULL;
-  mustache_compile(source, strlen(source), &tpl);
-  return tpl;
-}
-
 int
 main(void)
 {
-  struct rendered r;
+  struct user u = {{0}};
+  void *string = NULL;
+  int r;
 
   /* A source that does not compile gives EILSEQ. The template still
    * exists, so the caller reads the message and disposes it. */
   {
     mustache_template *tpl = NULL;
-    int c = mustache_compile("{{#a}}", 6, &tpl);
-    expect(c == -1 && errno == EILSEQ, "parse gives EILSEQ");
+    r = mustache_compile("{{#a}}", 6, &tpl);
+    expect(r == -1 && errno == EILSEQ, "parse gives EILSEQ");
     expect(tpl != NULL && message_is(tpl, "an unclosed section"), "parse message");
-    r = rendered(tpl, NULL);
-    expect(r.result == -1 && r.error == EILSEQ, "a render of a refused template gives EILSEQ");
     mustache_dispose_template(tpl);
   }
 
-  /* A render that succeeds ends with MUSTACHE_RENDER, and the string
-   * holds the answer. */
+  /* A render that succeeds hands back the string of the host. */
   {
     const struct value world = {MUSTACHE_KIND_TEXT, "World", NULL};
     const struct value root = {MUSTACHE_KIND_MAP, NULL, &world};
     mustache_template *tpl = compiled("Hello {{a}}!");
-    r = rendered(tpl, &root);
-    expect(r.result == 0 && r.done_seen && strcmp(r.answer, "Hello World!") == 0, "render");
-    r = rendered(tpl, &root);
-    expect(r.result == 0 && strcmp(r.answer, "Hello World!") == 0, "a template renders again");
+    r = mustache_render(tpl, &root, release, &u, &string);
+    expect(r == 0 && strcmp(u.answer, "Hello World!") == 0, "render");
     mustache_dispose_template(tpl);
   }
 
-  /* A value that is not text gives EINVAL. MUSTACHE_DONE still comes
-   * first, so the host frees its string. */
+  /* A value that is not text gives EINVAL, and done still runs, so the
+   * host frees its string. */
   {
     const struct value list = {MUSTACHE_KIND_LIST, NULL, NULL};
     const struct value root = {MUSTACHE_KIND_MAP, NULL, &list};
     mustache_template *tpl = compiled("{{a}}");
-    r = rendered(tpl, &root);
-    expect(r.result == -1 && r.error == EINVAL && r.done_seen, "not_text gives EINVAL after DONE");
+    r = mustache_render(tpl, &root, release, &u, &string);
+    expect(r == -1 && errno == EINVAL, "not_text gives EINVAL");
     expect(message_is(tpl, "a value is not text"), "not_text message");
     mustache_dispose_template(tpl);
   }
@@ -167,8 +211,30 @@ main(void)
     for (i = 0; i < 40; i++) strcat(source, "{{#a}}");
     for (i = 0; i < 40; i++) strcat(source, "{{/a}}");
     tpl = compiled(source);
-    r = rendered(tpl, &root);
-    expect(r.result == -1 && r.error == ELOOP && r.done_seen, "nesting gives ELOOP");
+    r = mustache_render(tpl, &root, release, &u, &string);
+    expect(r == -1 && errno == ELOOP, "nesting gives ELOOP");
+    mustache_dispose_template(tpl);
+  }
+
+  /* mustache_next names the setter that is still missing, one after the
+   * other, and MUSTACHE_RENDER when none is. A render on a template with
+   * a missing callback does not start: it gives the same code and only
+   * releases the root. */
+  {
+    mustache_template *tpl = NULL;
+    const struct value root = {MUSTACHE_KIND_MAP, NULL, NULL};
+    mustache_compile("x", 1, &tpl);
+    expect(mustache_next(tpl) == MUSTACHE_SET_FIND, "the first missing setter is find");
+    r = mustache_render(tpl, &root, release, &u, &string);
+    expect(r == MUSTACHE_SET_FIND, "a render without callbacks names the missing setter");
+    mustache_set_find(tpl, find);
+    mustache_set_kind(tpl, kind);
+    expect(mustache_next(tpl) == MUSTACHE_SET_TEXT, "after find and kind, text is missing");
+    r = mustache_set_text(tpl, NULL);
+    expect(r == -1 && errno == EINVAL, "a null callback gives EINVAL");
+    mustache_dispose_template(tpl);
+    tpl = compiled("x");
+    expect(mustache_next(tpl) == MUSTACHE_RENDER, "with every callback set the template can render");
     mustache_dispose_template(tpl);
   }
 
@@ -178,42 +244,25 @@ main(void)
     unsigned long long other = 0;
     const char *message = NULL;
     size_t size = 0;
-    expect(mustache_render((mustache_template *)&other, NULL) == -1 && errno == EBADF, "a foreign pointer gives EBADF");
+    expect(mustache_next((const mustache_template *)&other) == -1 && errno == EBADF, "a foreign pointer gives EBADF");
     expect(mustache_message(NULL, &message, &size) == -1 && errno == EBADF, "NULL gives EBADF");
   }
 
-  /* A render starts only when the last one ended, and an answer comes
-   * only after a request that needs one. */
+  /* A callback that renders the template it runs in gets EBUSY, and the
+   * outer render goes on. */
   {
     const struct value world = {MUSTACHE_KIND_TEXT, "World", NULL};
     const struct value root = {MUSTACHE_KIND_MAP, NULL, &world};
-    mustache_template *tpl = compiled("{{a}}");
-    expect(mustache_answer(tpl, NULL, NULL, 0) == -1 && errno == EINVAL, "an answer without a request gives EINVAL");
-    expect(mustache_render(tpl, &root) == 0, "render starts");
-    expect(mustache_render(tpl, &root) == -1 && errno == EBUSY, "a second render gives EBUSY");
+    mustache_template *tpl = compiled("Hello {{a}}!");
+    reentered = tpl;
+    mustache_set_kind(tpl, kind_that_renders_again);
+    r = mustache_render(tpl, &root, release, &u, &string);
+    expect(r == 0 && strcmp(u.answer, "Hello World!") == 0, "the outer render goes on");
+    expect(reentered_result == -1 && reentered_errno == EBUSY, "a render inside a render gives EBUSY");
     mustache_dispose_template(tpl);
   }
 
-  /* A host that cannot give the first string answers NULL. No string
-   * exists then, so the render ends with ENOMEM and no MUSTACHE_DONE. */
-  {
-    mustache_template *tpl = compiled("x");
-    const void *value = NULL;
-    const char *text = NULL;
-    size_t size = 0;
-    size_t capacity = 0;
-    int n;
-    mustache_render(tpl, NULL);
-    n = mustache_next(tpl, &value, &text, &size, &capacity);
-    expect(n == MUSTACHE_NEW_STRING, "the first request is MUSTACHE_NEW_STRING");
-    mustache_answer_string(tpl, NULL, 0);
-    n = mustache_next(tpl, &value, &text, &size, &capacity);
-    expect(n == -1 && errno == ENOMEM, "a NULL string gives ENOMEM");
-    n = mustache_next(tpl, &value, &text, &size, &capacity);
-    expect(n == MUSTACHE_RENDER, "after the failure the template waits for a render");
-    mustache_dispose_template(tpl);
-  }
-
+  expect(released == 5, "every render releases its root once");
   printf("c_api: %s\n", failed == 0 ? "passed" : "failed");
   return failed == 0 ? 0 : 1;
 }
