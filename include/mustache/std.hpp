@@ -51,7 +51,7 @@ private:
 };
 
 struct Value {
-  std::variant<std::string, List, Map> v;
+  std::variant<std::string, List, Map, bool> v;
 };
 
 struct Entry {
@@ -132,7 +132,8 @@ tag_invoke(kind_of_tag, Host &, const Value *const v)
   switch (v->v.index()) {
     case 0:  return Kind::text;
     case 1:  return Kind::list;
-    default: return std::get<Map>(v->v).empty() ? Kind::falsy : Kind::map;
+    case 2:  return std::get<Map>(v->v).empty() ? Kind::falsy : Kind::map;
+    default: return std::get<bool>(v->v) ? Kind::truthy : Kind::falsy;
   }
 }
 
