@@ -1,0 +1,29 @@
+one container for all C++ runs (podman exec), JVM on the host
+sysbench cpu events/s, 10 x 1 s:
+2502.26 2547.85 2546.12 2506.73 2491.10 2474.28 2521.22 2424.08 2433.89 2461.54 
+round 1 kx-g++-Os-a finished_median 4220 ns cv 3.12 per_render_median 9001 ns cv 7.04 
+round 1 kx-g++-O2-a finished_median 2785 ns cv 6.92 per_render_median 4774 ns cv 4.60 
+round 1 kx-g++-Os-b finished_median 4618 ns cv 21.47 per_render_median 8537 ns cv 10.02 
+round 1 kx-g++-O2-b finished_median 2572 ns cv 7.16 per_render_median 4630 ns cv 7.53 
+round 1 kotlinx finished 33623 ns median cv 2.64  per_render 36118 ns median cv 14.07  
+round 2 kx-g++-Os-a finished_median 4153 ns cv 6.57 per_render_median 9264 ns cv 7.06 
+round 2 kx-g++-O2-a finished_median 2721 ns cv 7.49 per_render_median 5139 ns cv 5.85 
+round 2 kx-g++-Os-b finished_median 4333 ns cv 10.21 per_render_median 8731 ns cv 6.06 
+round 2 kx-g++-O2-b finished_median 2802 ns cv 11.68 per_render_median 4745 ns cv 5.79 
+round 2 kotlinx finished 32260 ns median cv 3.03  per_render 36087 ns median cv 4.08  
+round 3 kx-g++-Os-a finished_median 4328 ns cv 6.29 per_render_median 10130 ns cv 7.22 
+round 3 kx-g++-O2-a finished_median 2784 ns cv 5.82 per_render_median 4744 ns cv 6.05 
+round 3 kx-g++-Os-b finished_median 4275 ns cv 6.12 per_render_median 9101 ns cv 4.93 
+round 3 kx-g++-O2-b finished_median 2611 ns cv 4.18 per_render_median 4800 ns cv 3.04 
+round 3 kotlinx finished 31464 ns median cv 7.21  per_render 38357 ns median cv 8.87  
+round 4 kx-g++-Os-a finished_median 4172 ns cv 4.76 per_render_median 8440 ns cv 4.55 
+round 4 kx-g++-O2-a finished_median 2946 ns cv 5.19 per_render_median 4807 ns cv 8.51 
+round 4 kx-g++-Os-b finished_median 4220 ns cv 2.58 per_render_median 9449 ns cv 4.50 
+round 4 kx-g++-O2-b finished_median 2641 ns cv 8.04 per_render_median 4734 ns cv 6.55 
+round 4 kotlinx finished 34692 ns median cv 3.88  per_render 37851 ns median cv 10.69  
+round 5 kx-g++-Os-a finished_median 4241 ns cv 3.78 per_render_median 8447 ns cv 15.35 
+round 5 kx-g++-O2-a finished_median 2577 ns cv 6.75 per_render_median 4934 ns cv 5.83 
+round 5 kx-g++-Os-b finished_median 4238 ns cv 12.03 per_render_median 9389 ns cv 11.50 
+round 5 kx-g++-O2-b finished_median 2761 ns cv 11.55 per_render_median 4854 ns cv 5.74 
+round 5 kotlinx finished 31145 ns median cv 11.16  per_render 33974 ns median cv 4.87  
+steal ticks during run: 755

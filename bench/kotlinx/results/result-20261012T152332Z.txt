@@ -1,0 +1,29 @@
+machine: 4 cpu, 6.18.44-fc-v114, model name	: Intel(R) Xeon(R) Processor @ 2.80GHz
+user=root nice=-15
+sysbench events/s:
+
+round 1 kx-g++-Os-a 4310 ns median cv 7.60 
+round 1 kx-g++-O2-a 3124 ns median cv 26.10 
+round 1 kx-g++-Os-b 4390 ns median cv 10.07 
+round 1 kx-g++-O2-b 2892 ns median cv 10.10 
+round 1 kotlinx 37278.546 ns avg ± 8278.651
+round 2 kx-g++-Os-a 4246 ns median cv 4.31 
+round 2 kx-g++-O2-a 2784 ns median cv 10.53 
+round 2 kx-g++-Os-b 4668 ns median cv 16.04 
+round 2 kx-g++-O2-b 3231 ns median cv 13.36 
+round 2 kotlinx 36194.947 ns avg ± 3440.767
+round 3 kx-g++-Os-a 4299 ns median cv 27.88 
+round 3 kx-g++-O2-a 2579 ns median cv 2.48 
+round 3 kx-g++-Os-b 3876 ns median cv 6.11 
+round 3 kx-g++-O2-b 2714 ns median cv 14.73 
+round 3 kotlinx 37478.313 ns avg ± 14534.304
+round 4 kx-g++-Os-a 4459 ns median cv 7.98 
+round 4 kx-g++-O2-a 2571 ns median cv 8.19 
+round 4 kx-g++-Os-b 3834 ns median cv 18.62 
+round 4 kx-g++-O2-b 2667 ns median cv 9.90 
+round 4 kotlinx 36915.701 ns avg ± 7237.206
+round 5 kx-g++-Os-a 4977 ns median cv 12.73 
+round 5 kx-g++-O2-a 2493 ns median cv 2.48 
+round 5 kx-g++-Os-b 4323 ns median cv 7.17 
+round 5 kx-g++-O2-b 3113 ns median cv 16.11 
+round 5 kotlinx 35203.868 ns avg ± 5949.645
